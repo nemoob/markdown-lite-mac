@@ -37,6 +37,9 @@ swift format lint --strict --recursive \
 swift build --disable-sandbox --package-path "$PROJECT_DIR" -Xswiftc -warnings-as-errors
 # 标准 SwiftPM 测试显式串行执行，避免共享测试进程的调度影响确定性回归。
 swift test --disable-sandbox --package-path "$PROJECT_DIR" --no-parallel -Xswiftc -warnings-as-errors
+# 大样本端到端测试只在独立 release 进程执行，避免 Debug 全量测试重复 50MB IO。
+swift test --configuration release --disable-sandbox --package-path "$PROJECT_DIR" \
+    --no-parallel -Xswiftc -warnings-as-errors --filter WorkspaceEndToEndPerformanceTests
 # 发布配置的独立进程验证完整链路和两档性能目标，口径与最终应用一致。
 swift run --configuration release --disable-sandbox --package-path "$PROJECT_DIR" \
     -Xswiftc -warnings-as-errors MarkdownLiteMac --self-check

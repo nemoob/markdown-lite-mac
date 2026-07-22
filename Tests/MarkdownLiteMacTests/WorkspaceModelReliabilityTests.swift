@@ -163,6 +163,246 @@ struct WorkspaceModelReliabilityTests {
         #expect(document.isDirty)
     }
 
+    // 首尾和相邻重排必须只改变数组顺序，不重建任何编辑器对象。
+    @Test("标签首尾与相邻移动保留编辑状态")
+    @MainActor
+    func testTabMovesPreserveEditorIdentityAndState() throws {
+        // 创建本次标签顺序测试独享目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 用四个真实恢复标签覆盖首尾和相邻路径。
+        let fixture = try makeWorkspace(documentCount: 4, activeIndex: 1, at: root)
+        // 测试退出前停止全部标签的延迟任务。
+        defer { fixture.workspace.documents.forEach { $0.prepareForClose() } }
+        // 保留初始对象引用，后续使用身份比较防止偷换模型。
+        let originalDocuments = fixture.workspace.documents
+        // 给活动标签写入尚未保存的可识别正文。
+        originalDocuments[1].text = "必须跟随原对象的编辑"
+        // 记录重排全程必须保持的活动 UUID。
+        let activeID = fixture.workspace.activeDocumentID
+
+        // 首标签移到 count 槽位后必须成为最后一项。
+        #expect(
+            fixture.workspace.moveDocument(
+                id: originalDocuments[0].id,
+                to: originalDocuments.count
+            )
+        )
+        // 首到尾的期望顺序只使用原 UUID。
+        #expect(
+            fixture.workspace.documents.map(\.id) == [
+                originalDocuments[1].id,
+                originalDocuments[2].id,
+                originalDocuments[3].id,
+                originalDocuments[0].id,
+            ]
+        )
+        // 活动标签向右移一位必须与相邻标签换序。
+        #expect(fixture.workspace.moveActiveDocument(by: 1))
+        // 右移后活动标签应位于原第三个标签之后。
+        #expect(
+            fixture.workspace.documents.map(\.id) == [
+                originalDocuments[2].id,
+                originalDocuments[1].id,
+                originalDocuments[3].id,
+                originalDocuments[0].id,
+            ]
+        )
+        // 活动标签再向左移一位必须恢复前一顺序。
+        #expect(fixture.workspace.moveActiveDocument(by: -1))
+        // 末标签移到 0 槽位必须回到首位。
+        #expect(fixture.workspace.moveDocument(id: originalDocuments[0].id, to: 0))
+        // 再把当前末标签移到首位，留下与初始不同的最终持久化顺序。
+        #expect(fixture.workspace.moveDocument(id: originalDocuments[3].id, to: 0))
+
+        // 最终顺序必须精确反映所有首尾和相邻操作。
+        let expectedOrder = [
+            originalDocuments[3].id,
+            originalDocuments[0].id,
+            originalDocuments[1].id,
+            originalDocuments[2].id,
+        ]
+        // 内存标签数组必须发布最终顺序。
+        #expect(fixture.workspace.documents.map(\.id) == expectedOrder)
+        // 每个位置都必须仍是初始 EditorModel 实例。
+        #expect(fixture.workspace.documents[0] === originalDocuments[3])
+        #expect(fixture.workspace.documents[1] === originalDocuments[0])
+        #expect(fixture.workspace.documents[2] === originalDocuments[1])
+        #expect(fixture.workspace.documents[3] === originalDocuments[2])
+        // 重排不得改变活动 UUID。
+        #expect(fixture.workspace.activeDocumentID == activeID)
+        // dirty 状态必须跟随原编辑器对象。
+        #expect(originalDocuments[1].isDirty)
+        // 未保存正文必须逐字保留。
+        #expect(originalDocuments[1].text == "必须跟随原对象的编辑")
+        // 成功反馈不应被旧会话状态覆盖。
+        #expect(fixture.workspace.status == "标签已移动")
+        // 直接读回会话证明最终顺序已落盘。
+        let session = try #require(try fixture.sessionStore.load())
+        // 持久化 UUID 顺序必须与内存一致。
+        #expect(session.documents.map(\.id) == expectedOrder)
+        // 持久化活动 UUID 也必须保持不变。
+        #expect(session.activeDocumentID == activeID)
+    }
+
+    // 无效、越界和原位操作必须在会话层之前返回。
+    @Test("标签无效与原位移动不落盘")
+    @MainActor
+    func testInvalidAndNoOpTabMovesDoNotPersist() throws {
+        // 创建可直接检查会话字节的独享目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 活动标签固定在首位，便于覆盖左边界。
+        let fixture = try makeWorkspace(documentCount: 3, activeIndex: 0, at: root)
+        // 测试退出前停止全部标签延迟任务。
+        defer { fixture.workspace.documents.forEach { $0.prepareForClose() } }
+        // 定位必须保持的 current 会话文件。
+        let currentURL = root.appendingPathComponent("WorkspaceSession.json", isDirectory: false)
+        // 定位用于识别意外写入的 previous 文件。
+        let previousURL = root.appendingPathComponent("WorkspaceSession.previous.json", isDirectory: false)
+        // 保存操作前 current 的精确字节。
+        let currentEvidence = try Data(contentsOf: currentURL)
+        // 使用无效但可精确比较的字节捕获任何意外轮换。
+        let previousEvidence = Data("原位移动不得写会话".utf8)
+        // 在所有无效操作前安装 previous 写入哨兵。
+        try previousEvidence.write(to: previousURL, options: [.atomic])
+        // 保存原标签顺序供所有分支共享核对。
+        let originalOrder = fixture.workspace.documents.map(\.id)
+        // 保存原工作区状态，无操作不应改写反馈。
+        let originalStatus = fixture.workspace.status
+
+        // 不存在的 UUID 必须直接失败。
+        #expect(!fixture.workspace.moveDocument(id: UUID(), to: 0))
+        // 负槽位必须直接失败。
+        #expect(!fixture.workspace.moveDocument(id: originalOrder[0], to: -1))
+        // 超过 count 的槽位必须直接失败。
+        #expect(!fixture.workspace.moveDocument(id: originalOrder[0], to: originalOrder.count + 1))
+        // 首标签自身前槽位是原位。
+        #expect(!fixture.workspace.moveDocument(id: originalOrder[0], to: 0))
+        // 首标签自身后槽位也是原位。
+        #expect(!fixture.workspace.moveDocument(id: originalOrder[0], to: 1))
+        // 末标签自身前槽位是原位。
+        #expect(!fixture.workspace.moveDocument(id: originalOrder[2], to: 2))
+        // 末标签自身后 count 槽位也是原位。
+        #expect(!fixture.workspace.moveDocument(id: originalOrder[2], to: 3))
+        // 活动标签零偏移必须是原位。
+        #expect(!fixture.workspace.moveActiveDocument(by: 0))
+        // 首标签再向左移必须拒绝越界。
+        #expect(!fixture.workspace.moveActiveDocument(by: -1))
+        // 极大偏移必须安全失败而不溢出。
+        #expect(!fixture.workspace.moveActiveDocument(by: Int.max))
+
+        // 所有无操作完成后标签顺序必须不变。
+        #expect(fixture.workspace.documents.map(\.id) == originalOrder)
+        // 工作区状态不得产生伪成功或伪失败。
+        #expect(fixture.workspace.status == originalStatus)
+        // current 字节不变证明没有会话写入。
+        #expect(try Data(contentsOf: currentURL) == currentEvidence)
+        // previous 哨兵不变证明没有发生双代轮换。
+        #expect(try Data(contentsOf: previousURL) == previousEvidence)
+    }
+
+    // 百标签重排必须保存完整 UUID 顺序并能跨启动恢复。
+    @Test("100 标签重排可跨启动恢复")
+    @MainActor
+    func testHundredTabMovePersistsAcrossRestart() throws {
+        // 创建本次大标签数测试独享目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 使用中间活动标签验证首标签移动不改变活动 UUID。
+        let fixture = try makeWorkspace(documentCount: 100, activeIndex: 50, at: root)
+        // 保存移动前稳定 UUID 顺序。
+        let originalOrder = fixture.workspace.documents.map(\.id)
+        // 保存跨启动必须恢复的活动 UUID。
+        let activeID = fixture.workspace.activeDocumentID
+
+        // 把首标签移到第 100 个插入槽，即数组末尾。
+        #expect(fixture.workspace.moveDocument(id: originalOrder[0], to: 100))
+        // 构造预期顺序，仅首元素移到末尾。
+        let expectedOrder = Array(originalOrder.dropFirst()) + [originalOrder[0]]
+        // 内存应立即发布全部 100 个标签的新顺序。
+        #expect(fixture.workspace.documents.map(\.id) == expectedOrder)
+        // 活动 UUID 不应因前方标签移动而改变。
+        #expect(fixture.workspace.activeDocumentID == activeID)
+        // 停止原工作区任务，模拟进程退出后的静止状态。
+        fixture.workspace.documents.forEach { $0.prepareForClose() }
+
+        // 使用同一隔离目录创建全新工作区。
+        let restoredWorkspace = WorkspaceModel(
+            documentStore: DocumentSupportStore(rootDirectory: root),
+            sessionStore: WorkspaceSessionStore(rootDirectory: root),
+            restoresSession: true
+        )
+        // 测试结束前停止新工作区全部延迟任务。
+        defer { restoredWorkspace.documents.forEach { $0.prepareForClose() } }
+        // 重启后必须恢复完整 100 标签顺序。
+        #expect(restoredWorkspace.documents.map(\.id) == expectedOrder)
+        // 重启后活动 UUID 必须与移动前相同。
+        #expect(restoredWorkspace.activeDocumentID == activeID)
+    }
+
+    // 会话不能落盘时必须保留可见顺序和编辑内容，同时明确返回失败。
+    @Test("标签移动会话保存失败可见")
+    @MainActor
+    func testTabMoveReportsSessionPersistenceFailure() throws {
+        // 创建可注入双代会话失败的独享目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 创建三个有效标签并使中间标签保持活动。
+        let fixture = try makeWorkspace(documentCount: 3, activeIndex: 1, at: root)
+        // 测试退出前停止全部标签延迟任务。
+        defer { fixture.workspace.documents.forEach { $0.prepareForClose() } }
+        // 保留原编辑器对象供失败后身份核对。
+        let originalDocuments = fixture.workspace.documents
+        // 给活动对象写入未保存正文，验证失败不丢编辑。
+        originalDocuments[1].text = "会话失败也不能丢失"
+        // 定位生产 current 会话文件。
+        let currentURL = root.appendingPathComponent("WorkspaceSession.json", isDirectory: false)
+        // 定位生产 previous 会话文件。
+        let previousURL = root.appendingPathComponent("WorkspaceSession.previous.json", isDirectory: false)
+        // current 使用可精确核对的损坏字节。
+        let currentEvidence = Data("{标签移动-current-损坏".utf8)
+        // previous 使用不同字节阻止存储层安全修复 current。
+        let previousEvidence = Data("{标签移动-previous-损坏".utf8)
+        // 覆盖 current 制造确定性保存失败。
+        try currentEvidence.write(to: currentURL, options: [.atomic])
+        // 同时覆盖 previous，确保不存在可用恢复源。
+        try previousEvidence.write(to: previousURL, options: [.atomic])
+        // 保存失败前的活动 UUID。
+        let activeID = fixture.workspace.activeDocumentID
+
+        // 首标签移到末尾后会话保存必须失败并返回 false。
+        #expect(!fixture.workspace.moveDocument(id: originalDocuments[0].id, to: 3))
+
+        // 内存顺序仍保留用户已看到的拖拽结果。
+        #expect(
+            fixture.workspace.documents.map(\.id) == [
+                originalDocuments[1].id,
+                originalDocuments[2].id,
+                originalDocuments[0].id,
+            ]
+        )
+        // 失败后仍必须使用原始 EditorModel 实例。
+        #expect(fixture.workspace.documents[0] === originalDocuments[1])
+        #expect(fixture.workspace.documents[1] === originalDocuments[2])
+        #expect(fixture.workspace.documents[2] === originalDocuments[0])
+        // 活动 UUID 不得因落盘失败而切换。
+        #expect(fixture.workspace.activeDocumentID == activeID)
+        // dirty 状态与正文必须继续留在原对象中。
+        #expect(originalDocuments[1].isDirty)
+        #expect(originalDocuments[1].text == "会话失败也不能丢失")
+        // 工作区必须发布会话保存失败而不是移动成功。
+        #expect(fixture.workspace.status.hasPrefix("会话保存失败："))
+        // current 损坏证据不得被新顺序覆盖。
+        #expect(try Data(contentsOf: currentURL) == currentEvidence)
+        // previous 损坏证据也必须逐字节保留。
+        #expect(try Data(contentsOf: previousURL) == previousEvidence)
+    }
+
     // 工作区必须串联会话与草稿上一代恢复，并把两种来源分别反馈给用户。
     @Test("上一代会话与草稿可完整恢复")
     @MainActor
@@ -768,6 +1008,50 @@ struct WorkspaceModelReliabilityTests {
         #expect(try sessionStore.loadPreviousGeneration() == previousSession)
         // previous 原始字节必须逐字节不变，防止语义失效 current 覆盖它。
         #expect(try Data(contentsOf: previousURL) == previousEvidence)
+    }
+
+    // 在隔离目录预置指定数量和活动位置的真实会话工作区。
+    @MainActor
+    private func makeWorkspace(
+        documentCount: Int,
+        activeIndex: Int,
+        at root: URL
+    ) throws -> (
+        workspace: WorkspaceModel,
+        sessionStore: WorkspaceSessionStore
+    ) {
+        // 测试夹具只接受至少一个标签。
+        precondition(documentCount > 0)
+        // 活动下标必须落在预置标签范围内。
+        precondition((0..<documentCount).contains(activeIndex))
+        // 文档存储与会话存储共享同一测试根目录。
+        let documentStore = DocumentSupportStore(rootDirectory: root)
+        // 会话存储供测试直接读回标签顺序。
+        let sessionStore = WorkspaceSessionStore(rootDirectory: root)
+        // 每个标签生成独立稳定 UUID。
+        let documentIDs = (0..<documentCount).map { _ in UUID() }
+        // 预置不依赖真实文件的未命名标签会话。
+        let session = WorkspaceSessionState(
+            documents: documentIDs.map {
+                // 每个描述使用自己的 UUID 并保持未命名身份。
+                WorkspaceSessionDocument(id: $0, fileURL: nil)
+            },
+            activeDocumentID: documentIDs[activeIndex]
+        )
+        // 先落盘真实会话，后续工作区必须走正式恢复路径。
+        try sessionStore.save(session)
+        // 使用生产初始化入口恢复全部标签对象。
+        let workspace = WorkspaceModel(
+            documentStore: documentStore,
+            sessionStore: sessionStore,
+            restoresSession: true
+        )
+        // 夹具构建必须精确恢复预置顺序。
+        #expect(workspace.documents.map(\.id) == documentIDs)
+        // 夹具活动 UUID 必须与预置下标一致。
+        #expect(workspace.activeDocumentID == documentIDs[activeIndex])
+        // 返回模型与可直接读回的会话存储。
+        return (workspace, sessionStore)
     }
 
     // 为每个测试创建唯一目录，避免并行执行时互相覆盖。

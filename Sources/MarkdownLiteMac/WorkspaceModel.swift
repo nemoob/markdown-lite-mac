@@ -161,6 +161,57 @@ final class WorkspaceModel: ObservableObject {
         activate(documents[nextIndex])
     }
 
+    // 按稳定 UUID 把标签移到移除前数组的插入槽位。
+    @discardableResult
+    func moveDocument(id: UUID, to destinationIndex: Int) -> Bool {
+        // 插入槽位范围是 0...count；0 表示首标签前，count 表示末标签后。
+        guard destinationIndex >= 0, destinationIndex <= documents.count else { return false }
+        // 无效 UUID 不能改变顺序或触发会话写入。
+        guard let sourceIndex = documents.firstIndex(where: { $0.id == id }) else { return false }
+        // 源标签位于目标槽之前时，移除它会让实际插入下标左移一位。
+        let resolvedIndex = destinationIndex > sourceIndex ? destinationIndex - 1 : destinationIndex
+        // 源标签自身前后两个槽位都解析为原位，不得落盘。
+        guard resolvedIndex != sourceIndex else { return false }
+        // 在局部数组上完成重排，只复制引用而不重建编辑器对象。
+        var reorderedDocuments = documents
+        // 取出原 EditorModel 引用，保留正文、dirty、选区和撤销关联。
+        let movedDocument = reorderedDocuments.remove(at: sourceIndex)
+        // 把同一对象插入已校正的最终下标。
+        reorderedDocuments.insert(movedDocument, at: resolvedIndex)
+        // 一次发布最终顺序，避免 UI 观察到标签短暂缺失。
+        documents = reorderedDocuments
+        // 活动 UUID 保持不变；只有新顺序安全落盘才返回成功。
+        guard persistSession() else { return false }
+        // 发布可见成功反馈，但不覆盖任何文档级状态。
+        status = "标签已移动"
+        // 明确告知调用方重排和持久化均已完成。
+        return true
+    }
+
+    // 按最终位置偏移当前活动标签，UI 左移和右移分别传 -1 与 1。
+    @discardableResult
+    func moveActiveDocument(by offset: Int) -> Bool {
+        // 零偏移是明确原位操作，不能触发会话写入。
+        guard offset != 0 else { return false }
+        // 没有有效活动 UUID 时不猜测要移动的标签。
+        guard let activeDocumentID,
+            let sourceIndex = documents.firstIndex(where: { $0.id == activeDocumentID })
+        else { return false }
+        // 使用溢出检查计算最终下标，任意外部偏移都不能崩溃。
+        let targetCalculation = sourceIndex.addingReportingOverflow(offset)
+        // 溢出或越过首尾时保持原顺序且不落盘。
+        guard !targetCalculation.overflow,
+            documents.indices.contains(targetCalculation.partialValue)
+        else { return false }
+        // 目标在右侧时传其后方槽位，抵消源标签移除造成的左移。
+        let destinationIndex =
+            targetCalculation.partialValue > sourceIndex
+            ? targetCalculation.partialValue + 1
+            : targetCalculation.partialValue
+        // 复用 UUID 入口的对象保留、持久化和失败反馈逻辑。
+        return moveDocument(id: activeDocumentID, to: destinationIndex)
+    }
+
     // 关闭指定标签；dirty 标签必须保存或安全落草稿。
     func close(_ document: EditorModel) {
         // 只处理当前数组中的精确对象。

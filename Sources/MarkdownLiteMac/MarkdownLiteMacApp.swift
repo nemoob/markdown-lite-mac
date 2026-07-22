@@ -194,6 +194,30 @@ struct MarkdownLiteMacApp: App {
                     workspace.activateAdjacentDocument(reverse: true)
                 }
                 .keyboardShortcut(.tab, modifiers: [.control, .shift])
+                // 分隔浏览与重排动作，避免用户把移动误认为激活。
+                Divider()
+                // 菜单和键盘共用模型层单步左移，VoiceOver 用户无需拖放。
+                Button("向左移动当前标签") {
+                    // 模型处理边界 no-op 和会话持久化。
+                    workspace.moveActiveDocument(by: -1)
+                }
+                // Control-Shift-PageUp 与日常文本光标键分离。
+                .keyboardShortcut(.pageUp, modifiers: [.control, .shift])
+                // 首个标签已无左侧槽位，菜单直接显示不可用。
+                .disabled(workspace.activeDocumentID == workspace.documents.first?.id)
+                // 明确说明操作对象是当前标签。
+                .accessibilityLabel("向左移动当前标签")
+                // 对称右移使用正向单步偏移。
+                Button("向右移动当前标签") {
+                    // 模型保持活动 UUID 不变，只调整数组顺序。
+                    workspace.moveActiveDocument(by: 1)
+                }
+                // Control-Shift-PageDown 与左移快捷键对称。
+                .keyboardShortcut(.pageDown, modifiers: [.control, .shift])
+                // 最后一个标签已无右侧槽位。
+                .disabled(workspace.activeDocumentID == workspace.documents.last?.id)
+                // 菜单项文案同时作为 VoiceOver 动作名。
+                .accessibilityLabel("向右移动当前标签")
             }
             // 显式把快捷键转发给原生 NSTextView 查找器。
             CommandMenu("查找") {

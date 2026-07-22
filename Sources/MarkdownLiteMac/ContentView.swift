@@ -700,24 +700,133 @@ private struct WorkspaceEditorView: View {
     }
 }
 
+// 自定义进程内类型避免把普通文本拖放误认为标签重排。
+private extension UTType {
+    // 该载荷只携带文档 UUID，不包含文档路径或正文。
+    static let markdownLiteDocumentTab = UTType(exportedAs: "com.nemoob.markdown-lite.document-tab")
+}
+
+// 区分目标标签左右两个插入槽位。
+private enum DocumentTabInsertionEdge: Equatable {
+    // 目标数组下标就是目标标签之前的插入槽。
+    case before
+    // 目标数组下标加一是目标标签之后的插入槽。
+    case after
+}
+
+// 保存当前悬停的目标标签和确切插入边。
+private struct DocumentTabDropTarget: Equatable {
+    // 稳定 UUID 让数组重排时不依赖可变文件名。
+    let documentID: UUID
+    // 左右边决定屏幕反馈和最终槽位。
+    let edge: DocumentTabInsertionEdge
+}
+
+// 用原生 DropDelegate 连续跟踪指针在标签左右半区的位置。
+private struct DocumentTabDropDelegate: DropDelegate {
+    // 当前视图代表的目标文档。
+    let documentID: UUID
+    // 实际标签宽度用于计算前后半区。
+    let targetWidth: CGFloat
+    // 共享悬停状态保证同时只显示一条插入线。
+    @Binding var dropTarget: DocumentTabDropTarget?
+    // 落点解析后只向工作区提交 UUID 和槽位语义。
+    let onMove: (UUID, DocumentTabDropTarget) -> Void
+
+    // 只接受本应用定义的标签载荷。
+    func validateDrop(info: DropInfo) -> Bool {
+        // 其他文件、图片和文本拖放继续交给原有入口。
+        info.hasItemsConforming(to: [.markdownLiteDocumentTab])
+    }
+
+    // 首次进入标签时立即显示离指针最近的插入边。
+    func dropEntered(info: DropInfo) {
+        // 使用当前局部坐标计算前后槽位。
+        dropTarget = resolvedTarget(at: info.location.x)
+    }
+
+    // 指针在同一标签内跨过中线时刷新插入反馈。
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        // 左右半区每次更新都映射到确切边。
+        dropTarget = resolvedTarget(at: info.location.x)
+        // 用系统移动光标说明源标签不会被复制。
+        return DropProposal(operation: .move)
+    }
+
+    // 拖出当前目标后清除它的插入线。
+    func dropExited(info: DropInfo) {
+        // 只清理仍属于当前标签的状态，不覆盖新目标。
+        guard dropTarget?.documentID == documentID else { return }
+        // 拖出标签栏时没有模型调用，顺序保持不变。
+        dropTarget = nil
+    }
+
+    // 落下时异步读取进程内 UUID，再回主线程调用模型。
+    func performDrop(info: DropInfo) -> Bool {
+        // 以最终指针位置为准，不依赖上一次 hover 回调。
+        let finalTarget = resolvedTarget(at: info.location.x)
+        // 提交后立即清除视觉插入线。
+        dropTarget = nil
+        // 只取第一个本应用标签载荷。
+        guard let provider = info.itemProviders(for: [.markdownLiteDocumentTab]).first else {
+            // 没有有效载荷时声明未处理。
+            return false
+        }
+        // 从自定义 UTType 读取不含路径的 UUID 字节。
+        _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.markdownLiteDocumentTab.identifier) {
+            data,
+            _ in
+            // 缺失或非 UUID 载荷不修改任何标签状态。
+            guard let data,
+                let sourceID = UUID(uuidString: String(decoding: data, as: UTF8.self)),
+                sourceID != documentID
+            else { return }
+            // NSItemProvider 回调可在后台线程，工作区模型必须回主 actor 更新。
+            Task { @MainActor in
+                // 模型统一处理数组重排、原位 no-op 和会话持久化。
+                onMove(sourceID, finalTarget)
+            }
+        }
+        // 已接收合法的本应用拖放，具体重排结果由模型决定。
+        return true
+    }
+
+    // 用标签中线把局部横坐标转换成插入边。
+    private func resolvedTarget(at horizontalLocation: CGFloat) -> DocumentTabDropTarget {
+        // 左半区是 before，中线及右半区是 after。
+        let edge: DocumentTabInsertionEdge = horizontalLocation < targetWidth / 2 ? .before : .after
+        // 返回绑定当前稳定 UUID 的插入目标。
+        return DocumentTabDropTarget(documentID: documentID, edge: edge)
+    }
+}
+
 // 标签栏观察每个文档的 dirty 和文件名变化。
 private struct DocumentTabBar: View {
     // 工作区提供顺序、活动身份和关闭动作。
     @ObservedObject var workspace: WorkspaceModel
+    // 共享当前悬停槽位，确保标签之间只显示一个插入反馈。
+    @State private var dropTarget: DocumentTabDropTarget?
 
     // 使用横向滚动容纳多个日常文档标签。
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(spacing: 4) {
                 ForEach(workspace.documents) { document in
+                    // 当前下标只用于 VoiceOver 序号和落点槽位计算。
+                    let position = workspace.documents.firstIndex(where: { $0.id == document.id }) ?? 0
                     DocumentTabItem(
                         document: document,
                         isActive: document.id == workspace.activeDocumentID,
+                        position: position,
+                        documentCount: workspace.documents.count,
+                        insertionEdge: dropTarget?.documentID == document.id ? dropTarget?.edge : nil,
+                        dropTarget: $dropTarget,
                         onActivate: {
                             workspace.activate(document)
                             NativeEditorActions.focus(documentID: document.id)
                         },
-                        onClose: { workspace.close(document) }
+                        onClose: { workspace.close(document) },
+                        onMove: moveDocument
                     )
                 }
             }
@@ -727,6 +836,18 @@ private struct DocumentTabBar: View {
         .frame(height: 38)
         .background(Color(nsColor: .windowBackgroundColor))
     }
+
+    // 把目标标签的前后边转换为模型定义的“移除前插入槽”。
+    private func moveDocument(_ sourceID: UUID, to target: DocumentTabDropTarget) {
+        // 重排期间目标已消失时不修改当前顺序。
+        guard let targetIndex = workspace.documents.firstIndex(where: { $0.id == target.documentID }) else {
+            return
+        }
+        // before 直接使用目标下标，after 使用其后一个插入槽。
+        let destinationIndex = target.edge == .before ? targetIndex : targetIndex + 1
+        // 模型层负责前移校正、原位 no-op 和会话持久化。
+        workspace.moveDocument(id: sourceID, to: destinationIndex)
+    }
 }
 
 // 单个标签把激活和关闭拆成两个明确点击目标。
@@ -735,10 +856,32 @@ private struct DocumentTabItem: View {
     @ObservedObject var document: EditorModel
     // 活动标签使用更清晰的系统背景。
     let isActive: Bool
+    // 从零开始的当前位置供 VoiceOver 朗读。
+    let position: Int
+    // 总数帮助非视觉用户理解标签相对位置。
+    let documentCount: Int
+    // 当前标签只在成为落点时显示左或右插入线。
+    let insertionEdge: DocumentTabInsertionEdge?
+    // DropDelegate 写入标签栏共享的唯一悬停目标。
+    @Binding var dropTarget: DocumentTabDropTarget?
+    // 实际布局宽度让拖放左右半区随文件名长度变化。
+    @State private var tabWidth: CGFloat = 1
     // 主区域点击激活标签。
     let onActivate: () -> Void
     // 关闭按钮执行带数据保护的工作区流程。
     let onClose: () -> Void
+    // 有效落点把源 UUID 和目标槽位交回标签栏。
+    let onMove: (UUID, DocumentTabDropTarget) -> Void
+
+    // 预先组合 VoiceOver 文案，避免复杂视图表达式反复推断字符串类型。
+    private var accessibilityDescription: String {
+        // 活动标签增加“当前”前缀，其他标签保持简洁。
+        let activeDescription = isActive ? "当前" : ""
+        // 保存状态使用与 dirty 指示点一致的语义。
+        let saveDescription = document.isDirty ? "有未保存修改" : "已保存"
+        // 合并文件名、位置和状态供一次连续朗读。
+        return "\(activeDescription)标签 \(document.filename)，第 \(position + 1) 个，共 \(documentCount) 个，\(saveDescription)"
+    }
 
     // 构建紧凑原生标签外观。
     var body: some View {
@@ -756,12 +899,18 @@ private struct DocumentTabItem: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            // VoiceOver 同时读出标签位置、活动状态和 dirty 状态。
+            .accessibilityLabel(accessibilityDescription)
+            // 提示非鼠标用户可通过原生菜单重排，不必使用拖放。
+            .accessibilityHint("按下以激活；可使用“标签”菜单向左或向右移动")
             Button(action: onClose) {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .semibold))
             }
             .buttonStyle(.plain)
             .help("关闭标签")
+            // 关闭按钮单独读出文件名，避免与激活按钮混淆。
+            .accessibilityLabel("关闭标签 \(document.filename)")
         }
         .font(.caption)
         .padding(.horizontal, 9)
@@ -770,10 +919,69 @@ private struct DocumentTabItem: View {
             RoundedRectangle(cornerRadius: 7)
                 .fill(isActive ? Color.accentColor.opacity(0.16) : Color.secondary.opacity(0.07))
         )
+        // 背景测量不参与点击命中，只为 DropDelegate 提供实际宽度。
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    // 首次布局完成后保存真实宽度。
+                    .onAppear {
+                        tabWidth = geometry.size.width
+                    }
+                    // 文件名变化时同步新宽度，保持中线准确。
+                    .onChange(of: geometry.size.width) { _, newWidth in
+                        tabWidth = newWidth
+                    }
+            }
+        }
         .overlay {
             RoundedRectangle(cornerRadius: 7)
                 .stroke(isActive ? Color.accentColor.opacity(0.35) : Color.clear, lineWidth: 1)
         }
+        // 悬停在左半或右半时显示对应的原生强调色插入线。
+        .overlay(alignment: insertionEdge == .before ? .leading : .trailing) {
+            if insertionEdge != nil {
+                // 细线不遮挡标签文字，但能明确区分插入前后。
+                Capsule()
+                    .fill(Color.accentColor)
+                    .frame(width: 3)
+                    .padding(.vertical, 2)
+                    .accessibilityHidden(true)
+            }
+        }
+        // 拖起时只提供进程内 UUID 载荷，不暴露路径或正文。
+        .onDrag(makeDragProvider)
+        // 每个标签在自己的局部坐标中计算前后落点。
+        .onDrop(
+            of: [.markdownLiteDocumentTab],
+            delegate: DocumentTabDropDelegate(
+                documentID: document.id,
+                targetWidth: tabWidth,
+                dropTarget: $dropTarget,
+                onMove: onMove
+            )
+        )
+        // 鼠标用户可发现拖放，同时指向可替代的菜单路径。
+        .help("拖动以重新排列；也可使用“标签”菜单移动")
+    }
+
+    // 构建只在本应用进程内可见的标签拖放载荷。
+    private func makeDragProvider() -> NSItemProvider {
+        // UUID 编码为 UTF-8，载荷不包含用户数据。
+        let payload = Data(document.id.uuidString.utf8)
+        // 使用系统项目提供器参与标准拖放会话。
+        let provider = NSItemProvider()
+        // ownProcess 阻止其他应用把内部 UUID 当成可交换数据。
+        provider.registerDataRepresentation(
+            forTypeIdentifier: UTType.markdownLiteDocumentTab.identifier,
+            visibility: .ownProcess
+        ) { completion in
+            // 载荷已在主线程生成，提供器只返回不可变 Data。
+            completion(payload, nil)
+            // 小型内存载荷无需额外 Progress 对象。
+            return nil
+        }
+        // 返回已注册自定义类型的提供器。
+        return provider
     }
 }
 
