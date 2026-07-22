@@ -661,6 +661,10 @@ private struct PersistentDocumentEditor: View {
             onImportImageData: { data, filename in
                 ImageImportUI.storeImageData(data, filename: filename, into: document)
             },
+            onUndoRedoTextChange: {
+                // 只在原生撤销或重做后按保存快照精确校准当前标签 dirty 状态。
+                document.reconcileDirtyAfterUndoRedo()
+            },
             onSelectionLineChanged: onSelectionLineChanged
         )
     }

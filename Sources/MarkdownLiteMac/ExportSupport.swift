@@ -1,5 +1,7 @@
 import AppKit
+import Darwin
 import Foundation
+import ImageIO
 import UniformTypeIdentifiers
 
 // 定义公众号导出的稳定模板标识，便于菜单展示和后续持久化选择。
@@ -32,32 +34,194 @@ struct WechatExportPayload: Sendable {
     let plainText: String
 }
 
+// 集中定义单文件 HTML 可接受的本地图片字节预算。
+struct PortableHTMLImageLimits: Equatable, Sendable {
+    // 单张图片上限阻止异常文件造成过高的读取和 Base64 内存开销。
+    let singleImageByteCount: Int64
+    // 去重后的全部图片上限约束最终 HTML 和导出峰值内存。
+    let totalImageByteCount: Int64
+
+    // 正式导出默认允许单张图片最多二十五 MiB。
+    static let standard = PortableHTMLImageLimits(
+        singleImageByteCount: 25 * 1_024 * 1_024,
+        // 正式导出默认允许全部唯一图片最多一百 MiB。
+        totalImageByteCount: 100 * 1_024 * 1_024
+    )
+}
+
+// 汇总可携带 HTML 在读取本地图片前主动识别的失败原因。
+enum PortableHTMLExportError: LocalizedError, Equatable {
+    // 未保存文档没有可信目录，不能解析相对或 file 图片。
+    case documentMustBeSaved(String)
+    // 本地引用未通过现有解析器或解析后越过文档目录。
+    case unsafeLocalImageReference(String)
+    // 图片不存在、不可读或不是普通文件。
+    case localImageUnavailable(String)
+    // 扩展名合法但内容不是系统可识别图片。
+    case invalidLocalImage(String)
+    // 单张真实文件超过导出预算，不能进入内存或 Base64 编码。
+    case localImageTooLarge(String, Int64, Int64)
+    // 去重后的图片总字节数超过整次导出预算。
+    case totalLocalImagesTooLarge(String, Int64)
+    // 图片读取发生系统错误。
+    case localImageReadFailed(String, String)
+
+    // 返回不泄漏额外目录信息、可直接展示给用户的中文说明。
+    var errorDescription: String? {
+        // 按失败原因说明必须修复的 Markdown 图片引用。
+        switch self {
+        case let .documentMustBeSaved(source):
+            // 未命名文档先保存后才能建立图片安全根目录。
+            return "本地图片“\(source)”无法导出：请先保存 Markdown 文档。"
+        case let .unsafeLocalImageReference(source):
+            // 越界、软链接出界和不支持的路径都使用同一安全提示。
+            return "本地图片“\(source)”无法导出：路径必须位于 Markdown 文档目录内。"
+        case let .localImageUnavailable(source):
+            // 缺失和权限问题都要求用户修复原始资源后重试。
+            return "本地图片“\(source)”无法导出：文件不存在、不可读取或不是普通文件。"
+        case let .invalidLocalImage(source):
+            // 伪装扩展名不能被内嵌到可携带 HTML。
+            return "本地图片“\(source)”无法导出：文件内容不是可识别的图片。"
+        case let .localImageTooLarge(source, _, limit):
+            // 单图超限时展示可直接采取压缩行动的明确阈值。
+            return "本地图片“\(source)”无法导出：单张图片不能超过\(Self.formattedByteCount(limit))。"
+        case let .totalLocalImagesTooLarge(source, limit):
+            // 累计超限说明当前图片触发整篇文档预算，便于用户定位和删减。
+            return "本地图片“\(source)”无法导出：全部图片合计不能超过\(Self.formattedByteCount(limit))。"
+        case let .localImageReadFailed(source, reason):
+            // 保留系统简短原因，便于定位临时 IO 或权限失败。
+            return "本地图片“\(source)”读取失败：\(reason)"
+        }
+    }
+
+    // 把二进制字节预算转换成用户熟悉的简短容量说明。
+    private static func formattedByteCount(_ byteCount: Int64) -> String {
+        // 系统格式化器会按当前语言输出合适的 KiB 或 MiB 单位。
+        ByteCountFormatter.string(fromByteCount: byteCount, countStyle: .binary)
+    }
+}
+
+// 标识一次目标文件提交资格，确保并发导出采用后发请求结果。
+private struct PortableHTMLCommitReservation: Sendable {
+    // 标准化目标路径用于区分不同导出文件。
+    let destinationPath: String
+    // 单调序号用于识别同一目标最后一次开始的请求。
+    let generation: UInt64
+}
+
+// 用短临界区协调跨标签的同目标原子提交，不串行化不同文件的解析和图片读取。
+private final class PortableHTMLCommitCoordinator: @unchecked Sendable {
+    // 锁只保护序号表和最终 rename 临界区。
+    private let lock = NSLock()
+    // 全局单调序号为每次导出提供稳定先后关系。
+    private var nextGeneration: UInt64 = 0
+    // 每个标准化目标只保留最后开始请求的序号。
+    private var latestGenerationByDestination: [String: UInt64] = [:]
+
+    // 在任何耗时生成前登记本次请求，使后发请求立即令旧请求失效。
+    func reserve(destination: URL) -> PortableHTMLCommitReservation {
+        // 解析目标父目录软链接，避免两个目录别名绕过同一文件的提交顺序。
+        let resolvedDirectory =
+            destination
+            .deletingLastPathComponent()
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        // 最终文件名保持原样，因为 rename 会替换该目录项而不是跟随既有目标链接。
+        let destinationPath =
+            resolvedDirectory
+            .appendingPathComponent(destination.lastPathComponent, isDirectory: false)
+            .path
+        // 序号和字典更新必须作为一个不可分割操作。
+        lock.lock()
+        // 任意返回路径都释放短锁。
+        defer { lock.unlock() }
+        // 应用生命周期内不会耗尽 UInt64，回绕加法仍避免异常崩溃。
+        nextGeneration &+= 1
+        // 保存本次唯一序号。
+        let generation = nextGeneration
+        // 新请求登记后，同目标更早请求不能再提交。
+        latestGenerationByDestination[destinationPath] = generation
+        // 返回供生成结束时核对的不可变资格。
+        return PortableHTMLCommitReservation(
+            destinationPath: destinationPath,
+            generation: generation
+        )
+    }
+
+    // 只允许同目标最后登记且未取消的请求执行最终原子替换。
+    func commit(
+        reservation: PortableHTMLCommitReservation,
+        operation: () throws -> Void
+    ) throws {
+        // 核对资格与 rename 必须处于同一短临界区，避免检查后被新请求插入。
+        lock.lock()
+        // rename 完成或抛错后立即释放，不阻塞后续不同目标提交。
+        defer { lock.unlock() }
+        // 字典为空或序号不同都表示本次结果已经过期。
+        guard latestGenerationByDestination[reservation.destinationPath] == reservation.generation else {
+            // 统一使用取消语义，让界面静默丢弃被替换的旧请求。
+            throw CancellationError()
+        }
+        // 任务取消也必须在持锁提交点再检查一次。
+        try Task.checkCancellation()
+        // 调用方只在这里执行一次同目录原子 rename。
+        try operation()
+    }
+
+    // 请求结束后只清理自己的最新登记，不能删除更晚请求的资格。
+    func finish(reservation: PortableHTMLCommitReservation) {
+        // 字典清理与并发登记使用同一把锁。
+        lock.lock()
+        // 所有分支都释放锁。
+        defer { lock.unlock() }
+        // 仅当前仍为最后请求时移除目标记录。
+        guard latestGenerationByDestination[reservation.destinationPath] == reservation.generation else {
+            // 更晚请求已经接管目标时保持其登记不变。
+            return
+        }
+        // 移除完成或失败的最后请求，避免目标表长期增长。
+        latestGenerationByDestination.removeValue(forKey: reservation.destinationPath)
+    }
+}
+
 // 提供不依赖第三方库的 HTML 导出与公众号复制能力。
 enum ExportSupport {
-    // 生成可直接在浏览器打开的完整 HTML 文档。
-    static func htmlDocument(markdown: String, title: String) -> String {
-        // 所有正文都先经过安全渲染，原始 HTML 不会原样进入结果。
-        let body = HTMLExportRenderer.renderFragment(markdown)
-        // 标题进入标签前统一转义，避免关闭 title 后注入标签。
-        let safeTitle = HTMLExportRenderer.escapeHTML(title)
+    // 所有文档共享提交协调器，跨标签导出同一路径仍遵循后发请求胜出。
+    private static let commitCoordinator = PortableHTMLCommitCoordinator()
 
-        // 使用内联样式保证单文件可用，同时用 CSP 限制脚本和危险资源。
-        return """
-            <!doctype html>
-            <html lang="zh-CN">
-            <head>
-              <meta charset="utf-8">
-              <meta name="viewport" content="width=device-width, initial-scale=1">
-              <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
-              <title>\(safeTitle)</title>
-            </head>
-            <body style="margin:0;background:#f6f7f9;color:#24292f;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Helvetica Neue',sans-serif;">
-              <main style="box-sizing:border-box;max-width:820px;min-height:100vh;margin:0 auto;padding:48px 56px;background:#ffffff;font-size:16px;line-height:1.8;word-break:break-word;">
-            \(body)
-              </main>
-            </body>
-            </html>
-            """
+    // 生成不会自动加载远程图片的完整 HTML 文档。
+    static func htmlDocument(markdown: String, title: String) -> String {
+        // 无文档上下文的旧入口保留正文结构，但所有图片采用离线占位策略。
+        let body = HTMLExportRenderer.renderFragment(
+            markdown,
+            imageRenderer: HTMLExportRenderer.renderOfflineImage
+        )
+        // 统一壳层只允许内部生成的 data 图片，不允许任何网络图片请求。
+        return makeHTMLDocument(body: body, title: title)
+    }
+
+    // 生成把安全本地图片直接嵌入 data URL 的单文件 HTML。
+    static func portableHTMLDocument(
+        markdown: String,
+        title: String,
+        documentURL: URL?,
+        limits: PortableHTMLImageLimits = .standard
+    ) throws -> String {
+        // 已取消任务不再开始 Markdown 解析或本地文件访问。
+        try Task.checkCancellation()
+        // 每次导出使用独立解析器，缓存同图并收集首次不可恢复错误。
+        let imageEmbedder = PortableHTMLImageEmbedder(documentURL: documentURL, limits: limits)
+        // 正文渲染仍复用既有块和行内 Markdown 逻辑。
+        let body = HTMLExportRenderer.renderFragment(
+            markdown,
+            imageRenderer: imageEmbedder.render
+        )
+        // 渲染完成后优先传播取消，避免取消请求被其他中间错误掩盖。
+        try Task.checkCancellation()
+        // 任一本地图片失败都阻止产出看似成功但丢图的 HTML。
+        if let error = imageEmbedder.firstError { throw error }
+        // 成功结果只依赖自身 data URL，不再依赖原文档目录。
+        return makeHTMLDocument(body: body, title: title)
     }
 
     // 生成适合粘贴到公众号编辑器的内联样式 HTML 片段。
@@ -66,7 +230,11 @@ enum ExportSupport {
         template: WechatExportTemplate = .simple
     ) -> String {
         // 公众号会清除外部样式，因此正文中的每个关键标签都使用内联样式。
-        let body = HTMLExportRenderer.renderFragment(markdown, template: template)
+        let body = HTMLExportRenderer.renderFragment(
+            markdown,
+            template: template,
+            imageRenderer: HTMLExportRenderer.renderWechatImage
+        )
         // 最外层 section 统一提供中文排版基线。
         return """
             <section style="\(template.containerStyle)">
@@ -119,13 +287,83 @@ enum ExportSupport {
         try html.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    // 弹出原生保存面板并保存 HTML；取消时返回 nil。
-    @MainActor
-    static func presentHTMLSavePanel(
+    // 在没有保存面板等 UI 副作用的前提下原子写入可携带单文件 HTML。
+    static func writePortableHTML(
         markdown: String,
         title: String,
-        suggestedFilename: String
-    ) throws -> URL? {
+        documentURL: URL?,
+        to url: URL,
+        limits: PortableHTMLImageLimits = .standard,
+        _beforeCommit: (() -> Void)? = nil
+    ) throws {
+        // 标签关闭或下一次导出已经替换当前请求时不再开始处理。
+        try Task.checkCancellation()
+        // 在耗时生成前登记目标顺序，后发请求可以立即淘汰当前旧结果。
+        let commitReservation = commitCoordinator.reserve(destination: url)
+        // 成功、失败或取消都释放本次登记，但不会误删更晚请求。
+        defer { commitCoordinator.finish(reservation: commitReservation) }
+        // 先完整解析并验证所有本地图片，失败时目标文件保持原状。
+        let html = try portableHTMLDocument(
+            markdown: markdown,
+            title: title,
+            documentURL: documentURL,
+            limits: limits
+        )
+        // 生成完成后再次响应取消，避免创建不再需要的临时文件。
+        try Task.checkCancellation()
+        // 临时文件必须与目标同目录，保证最终 rename 不会跨文件系统。
+        let temporaryURL = url.deletingLastPathComponent().appendingPathComponent(
+            ".markdown-lite-\(UUID().uuidString).tmp",
+            isDirectory: false
+        )
+        // 只有 rename 成功后才停止清理临时文件。
+        var didCommit = false
+        // 失败、取消和测试钩子退出都会尽力删除唯一临时文件。
+        defer {
+            // 已提交文件的旧临时路径已经不存在，无需重复访问文件系统。
+            if !didCommit {
+                // unlink 不跟随软链接且不会误删目标文件。
+                temporaryURL.withUnsafeFileSystemRepresentation { path in
+                    // 路径转换失败时没有可删除的有效本地文件。
+                    if let path { _ = Darwin.unlink(path) }
+                }
+            }
+        }
+        // 独占创建随机临时名，极端碰撞也不能覆盖其他文件。
+        try Data(html.utf8).write(to: temporaryURL, options: .withoutOverwriting)
+        // 测试可在临时文件完成后精确注入取消，生产调用保持 nil。
+        _beforeCommit?()
+        // 提交协调器在同一短临界区核对取消、后发请求和最终原子替换。
+        try commitCoordinator.commit(reservation: commitReservation) {
+            // 同目录 POSIX rename 以一次原子操作替换已有目标。
+            let renameResult = temporaryURL.withUnsafeFileSystemRepresentation { sourcePath in
+                // 目标路径同样必须能转换为本地文件系统表示。
+                url.withUnsafeFileSystemRepresentation { destinationPath in
+                    // 任一路径转换失败都使用 EINVAL 形成稳定系统错误。
+                    guard let sourcePath, let destinationPath else { return -EINVAL }
+                    // rename 会替换普通旧文件或链接，但不会产生半写目标。
+                    return Darwin.rename(sourcePath, destinationPath)
+                }
+            }
+            // 系统拒绝替换时保留 errno 并由 defer 清理临时文件。
+            guard renameResult == 0 else {
+                // 负 EINVAL 是路径转换失败的内部标记，其他失败读取即时 errno。
+                let errorCode = renameResult == -EINVAL ? EINVAL : errno
+                // 标准 Cocoa 调用方可直接展示系统提供的本地化文件错误。
+                throw NSError(
+                    domain: NSPOSIXErrorDomain,
+                    code: Int(errorCode),
+                    userInfo: [NSFilePathErrorKey: url.path]
+                )
+            }
+        }
+        // rename 成功表示目标已经完整替换，临时路径不再需要清理。
+        didCommit = true
+    }
+
+    // 弹出原生保存面板并只返回用户选择的目标；取消时返回 nil。
+    @MainActor
+    static func chooseHTMLDestination(suggestedFilename: String) -> URL? {
         // 配置系统保存面板，沿用原生文件访问和覆盖确认。
         let panel = NSSavePanel()
         // 仅允许导出标准 HTML 文件。
@@ -134,12 +372,8 @@ enum ExportSupport {
         panel.canCreateDirectories = true
         // 保证默认文件名具有 html 扩展名。
         panel.nameFieldStringValue = normalizedHTMLFilename(suggestedFilename)
-        // 用户取消时不创建任何文件。
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        // 用户确认后复用原子写入 API。
-        try writeHTML(markdown: markdown, title: title, to: url)
-        // 返回实际地址供状态栏反馈。
-        return url
+        // 只返回确认后的地址，耗时处理由调用方转到后台。
+        return panel.runModal() == .OK ? panel.url : nil
     }
 
     // 规范保存面板中的默认 HTML 文件名。
@@ -155,6 +389,29 @@ enum ExportSupport {
         }
         // 其他名称统一追加 html 扩展名。
         return "\(trimmed).html"
+    }
+
+    // 用统一离线 CSP 包装已经安全渲染的正文。
+    private static func makeHTMLDocument(body: String, title: String) -> String {
+        // 标题进入标签前统一转义，避免关闭 title 后注入标签。
+        let safeTitle = HTMLExportRenderer.escapeHTML(title)
+        // data 仅承载本次导出内部生成的图片，HTTP 与 HTTPS 均不具加载权限。
+        return """
+            <!doctype html>
+            <html lang="zh-CN">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'">
+              <title>\(safeTitle)</title>
+            </head>
+            <body style="margin:0;background:#f6f7f9;color:#24292f;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Helvetica Neue',sans-serif;">
+              <main style="box-sizing:border-box;max-width:820px;min-height:100vh;margin:0 auto;padding:48px 56px;background:#ffffff;font-size:16px;line-height:1.8;word-break:break-word;">
+            \(body)
+              </main>
+            </body>
+            </html>
+            """
     }
 }
 
@@ -285,8 +542,382 @@ private extension WechatExportTemplate {
     }
 }
 
+// 为一次可携带导出解析、验证并缓存全部本地图片。
+private final class PortableHTMLImageEmbedder {
+    // 文档地址决定相对图片和显式 file 图片共同的安全根目录。
+    private let documentURL: URL?
+    // 每次导出的单图与累计预算由调用入口统一传入。
+    private let limits: PortableHTMLImageLimits
+    // 同一真实图片只读取和编码一次，避免重复引用扩大 CPU 与临时内存成本。
+    private var dataURLByURL: [URL: String] = [:]
+    // 只累计已经验证并缓存的唯一图片原始字节数。
+    private var embeddedImageByteCount: Int64 = 0
+    // 首次失败决定整次导出的可行动错误，后续渲染不再读取其他本地文件。
+    private(set) var firstError: Error?
+
+    // 保存调用方提供的当前 Markdown 文件地址。
+    init(documentURL: URL?, limits: PortableHTMLImageLimits) {
+        // 标准化本地地址以稳定后续目录比较，非本地地址保留供明确报错。
+        self.documentURL = documentURL?.standardizedFileURL
+        // 保存当前导出的明确字节预算，测试可使用更小阈值覆盖边界。
+        self.limits = limits
+    }
+
+    // 按远程策略或本地嵌入策略渲染一张 Markdown 图片。
+    func render(_ imageURL: URL, _ alt: String) -> String {
+        // 保留 Markdown 解析器得到的原始地址语义供安全解析和错误提示。
+        let source = imageURL.absoluteString
+        // 任何失败路径都使用不发起网络或文件请求的安全占位。
+        let fallback = HTMLExportRenderer.renderOfflineImage(imageURL, alt)
+        // 已有失败时不继续读取图片，最终入口会抛出首次错误。
+        guard firstError == nil else { return fallback }
+
+        do {
+            // 每张图片处理前检查取消，避免继续打开本地文件。
+            try Task.checkCancellation()
+            // 按远程或本地策略生成当前图片的安全 HTML。
+            let html = try renderChecked(imageURL, alt: alt, source: source)
+            // 每张图片处理后再次检查取消，防止已取消结果进入最终文档。
+            try Task.checkCancellation()
+            // 只有完整处理且未取消的图片结果才交回 Markdown 渲染器。
+            return html
+        } catch is CancellationError {
+            // 保存标准取消错误，让同步渲染结束后仍能精确传播任务取消。
+            firstError = CancellationError()
+        } catch let error as PortableHTMLExportError {
+            // 只保留第一项，避免多个失败让状态栏说明失焦。
+            firstError = error
+        } catch {
+            // 防御未来支撑层抛出的其他错误并转换成稳定用户说明。
+            firstError = PortableHTMLExportError.localImageReadFailed(
+                source,
+                error.localizedDescription
+            )
+        }
+        // 当前 HTML 最终不会返回，但中间字符串仍保持安全。
+        return fallback
+    }
+
+    // 在已经检查取消的范围内区分远程占位和本地图片嵌入。
+    private func renderChecked(_ imageURL: URL, alt: String, source: String) throws -> String {
+        // HTTP 永久阻止，HTTPS 只输出显式链接而不创建图片请求。
+        switch EnhancedImageSourceResolver.remoteImageDecision(for: source) {
+        case .blocked, .requiresConfirmation:
+            // 远程图片不属于本地导出失败，使用离线占位继续生成正文。
+            return HTMLExportRenderer.renderOfflineImage(imageURL, alt)
+        case .notRemote:
+            // 本地和非法协议继续按 scheme 精确区分。
+            break
+        }
+
+        // data、javascript 等非本地协议只显示替代文字，不能进入 data 图片白名单。
+        if let scheme = imageURL.scheme?.lowercased(), scheme != "file" {
+            // 复用离线占位保证危险协议不会进入任何属性。
+            return HTMLExportRenderer.renderOfflineImage(imageURL, alt)
+        }
+        // 本地图必须完整解析并编码成功后才成为 img 标签。
+        return try embedLocalImage(source: source, alt: alt)
+    }
+
+    // 把一张位于文档目录内的真实图片转换成受 CSP 允许的 data URL。
+    private func embedLocalImage(source: String, alt: String) throws -> String {
+        // 未保存或非本地文档都没有可信图片根目录。
+        guard let documentURL, documentURL.isFileURL else {
+            // 明确要求先保存，而不是静默丢弃本地图片。
+            throw PortableHTMLExportError.documentMustBeSaved(source)
+        }
+        // 复用预览层对协议、扩展名、百分号和相对路径穿越的既有校验。
+        guard
+            let candidate = EnhancedImageSourceResolver.resolve(
+                source,
+                documentURL: documentURL
+            ),
+            candidate.isFileURL
+        else {
+            // 无法安全解析的本地引用不能读取或进入 HTML。
+            throw PortableHTMLExportError.unsafeLocalImageReference(source)
+        }
+
+        // 文档所在目录解析所有既有软链接后成为唯一可信根目录。
+        let documentDirectory = documentURL.deletingLastPathComponent()
+        // realpath 解析所有既有祖先软链接，Foundation 标准化只作为异常回退。
+        let resolvedDocumentDirectory =
+            Self.canonicalFileURL(documentDirectory)
+            ?? documentDirectory.resolvingSymlinksInPath().standardizedFileURL
+        // 候选图片同样解析软链接，显式 file URL 也不能借此逃逸。
+        let resolvedCandidate =
+            Self.canonicalFileURL(candidate)
+            ?? candidate.resolvingSymlinksInPath().standardizedFileURL
+        // 真实图片必须严格位于真实文档目录之内。
+        guard Self.isStrictDescendant(resolvedCandidate, of: resolvedDocumentDirectory) else {
+            // 外部文件和出界软链接使用相同安全错误。
+            throw PortableHTMLExportError.unsafeLocalImageReference(source)
+        }
+        // 重复引用直接复用完整 img 标签，避免再次读取和 Base64 编码。
+        if let cachedDataURL = dataURLByURL[resolvedCandidate] {
+            // 每次仍按当前 Markdown 替代文字生成独立无障碍说明。
+            return HTMLExportRenderer.renderEmbeddedImage(dataURL: cachedDataURL, alt: alt)
+        }
+
+        // 使用同一文件描述符完成类型、大小和内容读取，消除按路径二次打开窗口。
+        let data = try readLocalImage(
+            at: resolvedCandidate,
+            documentDirectory: resolvedDocumentDirectory,
+            source: source
+        )
+        // ImageIO 只读取图片源元信息并确认至少存在一帧。
+        guard
+            let imageSource = CGImageSourceCreateWithData(data as CFData, nil),
+            CGImageSourceGetCount(imageSource) > 0,
+            let typeIdentifier = CGImageSourceGetType(imageSource),
+            let imageType = UTType(typeIdentifier as String),
+            let mimeType = imageType.preferredMIMEType,
+            mimeType.lowercased().hasPrefix("image/")
+        else {
+            // 伪装扩展名或系统无法识别的内容不能嵌入。
+            throw PortableHTMLExportError.invalidLocalImage(source)
+        }
+
+        // Base64 只来自刚验证的本地图片字节，不能由 Markdown 注入 data 内容。
+        let dataURL = "data:\(mimeType);base64,\(data.base64EncodedString())"
+        // 生成带安全替代文字和统一响应式样式的本地 img 标签。
+        let html = HTMLExportRenderer.renderEmbeddedImage(dataURL: dataURL, alt: alt)
+        // 缓存图片数据地址供同一路径的后续引用复用。
+        dataURLByURL[resolvedCandidate] = dataURL
+        // 只有通过 ImageIO 校验的唯一图片才进入累计预算。
+        embeddedImageByteCount += Int64(data.count)
+        // 返回不依赖原文件位置的内嵌图片标签。
+        return html
+    }
+
+    // 使用不跟随任何软链接的同一文件描述符有界读取一张图片。
+    private func readLocalImage(
+        at candidate: URL,
+        documentDirectory: URL,
+        source: String
+    ) throws -> Data {
+        // O_NOFOLLOW 拒绝最终组件竞态，O_NONBLOCK 避免 FIFO 在 fstat 前阻塞。
+        let descriptor = candidate.withUnsafeFileSystemRepresentation { path in
+            // 无法转换成本地路径时按打开失败处理。
+            guard let path else { return Int32(-1) }
+            // 只读、禁止继承且不跟随最终组件软链接。
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)
+        }
+        // 立即保存 open 的 errno，避免后续 Swift 调用覆盖失败原因。
+        let openErrorCode = errno
+        // 打开失败时不再使用路径 API 尝试第二次读取。
+        guard descriptor >= 0 else {
+            // 路径链出现软链接说明原有安全检查后发生变化或引用本身不安全。
+            if openErrorCode == ELOOP {
+                throw PortableHTMLExportError.unsafeLocalImageReference(source)
+            }
+            // 缺失、权限拒绝和特殊节点统一给出可行动的资源不可用提示。
+            throw PortableHTMLExportError.localImageUnavailable(source)
+        }
+        // FileHandle 接管描述符并在所有成功或失败分支关闭它。
+        let fileHandle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        // 作用域退出前主动关闭，避免大量图片等待对象析构才释放描述符。
+        defer { try? fileHandle.close() }
+
+        // fstat 针对已经打开的同一对象读取类型与字节数。
+        var fileStatus = stat()
+        // 元数据读取失败时保留即时系统原因。
+        guard Darwin.fstat(descriptor, &fileStatus) == 0 else {
+            // 复制 errno 对应说明，避免后续 close 改变它。
+            let reason = Self.posixReason(errno)
+            // 系统级元数据失败按图片读取失败展示。
+            throw PortableHTMLExportError.localImageReadFailed(source, reason)
+        }
+        // 目录、FIFO、设备和 socket 均不得进入图片读取循环。
+        guard (fileStatus.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            // 非普通文件统一归入不可用资源。
+            throw PortableHTMLExportError.localImageUnavailable(source)
+        }
+
+        // F_GETPATH 从已打开对象取得实际路径，识别祖先目录被瞬时替换的情况。
+        var openedPath = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        // 使用 Swift 提供的非可变参数 fcntl 指针重载接收内核路径。
+        let pathResult = openedPath.withUnsafeMutableBufferPointer { buffer in
+            // 固定非空缓冲区始终提供有效首地址。
+            guard let baseAddress = buffer.baseAddress else { return Int32(-1) }
+            // 显式转换为原始指针，避免落入不可用的 C 可变参数声明。
+            return Darwin.fcntl(
+                descriptor,
+                F_GETPATH,
+                UnsafeMutableRawPointer(baseAddress)
+            )
+        }
+        // 无法确认已打开对象位置时不冒险读取内容。
+        guard pathResult == 0 else {
+            // 读取即时 errno 形成可展示的系统原因。
+            throw PortableHTMLExportError.localImageReadFailed(
+                source,
+                Self.posixReason(errno)
+            )
+        }
+        // 把内核实际路径转换回标准文件 URL。
+        let openedURL = openedPath.withUnsafeBufferPointer { buffer in
+            // F_GETPATH 成功保证首地址包含零结尾文件系统路径。
+            URL(
+                fileURLWithFileSystemRepresentation: buffer.baseAddress!,
+                isDirectory: false,
+                relativeTo: nil
+            ).standardizedFileURL
+        }
+        // 已打开对象仍必须严格位于 realpath 得到的文档目录内。
+        guard Self.isStrictDescendant(openedURL, of: documentDirectory) else {
+            // 父目录竞态或路径替换都不能越过安全根目录。
+            throw PortableHTMLExportError.unsafeLocalImageReference(source)
+        }
+
+        // 普通文件的 fstat 大小必须为非负值。
+        let fileByteCount = Int64(fileStatus.st_size)
+        // 异常负数元数据不能进入容量计算。
+        guard fileByteCount >= 0 else {
+            // 非法大小视为资源不可用。
+            throw PortableHTMLExportError.localImageUnavailable(source)
+        }
+        // 在分配或读取任何图片内容前拒绝超过单图预算的文件。
+        guard fileByteCount <= limits.singleImageByteCount else {
+            // 错误携带实际大小和阈值供测试及用户说明。
+            throw PortableHTMLExportError.localImageTooLarge(
+                source,
+                fileByteCount,
+                limits.singleImageByteCount
+            )
+        }
+        // 使用溢出安全加法计算 fstat 时刻的预计累计字节数。
+        let (projectedByteCount, didOverflow) = embeddedImageByteCount.addingReportingOverflow(
+            fileByteCount
+        )
+        // 在读取前拒绝累计超限或整数溢出。
+        guard !didOverflow, projectedByteCount <= limits.totalImageByteCount else {
+            // 累计错误只需展示整次导出阈值。
+            throw PortableHTMLExportError.totalLocalImagesTooLarge(
+                source,
+                limits.totalImageByteCount
+            )
+        }
+
+        // 并发增长时最多读取剩余预算加一字节，硬性限制峰值内存。
+        let remainingTotalByteCount = limits.totalImageByteCount - embeddedImageByteCount
+        // 单图和累计剩余额度取较小值作为本次硬上限。
+        let effectiveByteLimit = min(limits.singleImageByteCount, remainingTotalByteCount)
+        // 以固定块循环读取，避免 readToEnd 绕过文件增长保护。
+        let data = try readBoundedData(
+            from: fileHandle,
+            expectedByteCount: fileByteCount,
+            maximumByteCount: effectiveByteLimit
+        )
+        // 文件在 fstat 后增长超过单图阈值时仍给出精确单图错误。
+        guard Int64(data.count) <= limits.singleImageByteCount else {
+            // 实际读取到阈值加一即可证明超限，无需继续读取其余内容。
+            throw PortableHTMLExportError.localImageTooLarge(
+                source,
+                Int64(data.count),
+                limits.singleImageByteCount
+            )
+        }
+        // 文件增长超过累计剩余额度时拒绝当前图片。
+        guard Int64(data.count) <= remainingTotalByteCount else {
+            // 目标文件尚未写入，因此累计失败不会留下部分结果。
+            throw PortableHTMLExportError.totalLocalImagesTooLarge(
+                source,
+                limits.totalImageByteCount
+            )
+        }
+        // 返回由同一已校验描述符读取的完整图片字节。
+        return data
+    }
+
+    // 从普通文件描述符最多读取给定上限加一字节。
+    private func readBoundedData(
+        from fileHandle: FileHandle,
+        expectedByteCount: Int64,
+        maximumByteCount: Int64
+    ) throws -> Data {
+        // 预留 fstat 大小但不超过硬上限，降低正常文件扩容次数。
+        var data = Data()
+        // 当前生产阈值远低于 Int.max，转换前仍执行安全截断。
+        let reserveByteCount = min(expectedByteCount, maximumByteCount, Int64(Int.max))
+        // 非负预留值可安全转换成本机 Int。
+        data.reserveCapacity(Int(max(0, reserveByteCount)))
+        // 加一字节用于在不无界读取的前提下识别并发增长。
+        let (incrementedStopByteCount, didStopByteCountOverflow) = maximumByteCount.addingReportingOverflow(1)
+        // Int64 最大值无法再表示证明超限的额外字节，此时直接采用其自身作为理论上限。
+        let stopByteCount = didStopByteCountOverflow ? maximumByteCount : incrementedStopByteCount
+
+        // 每轮读取固定小块并在块间响应任务取消。
+        while Int64(data.count) < stopByteCount {
+            // 大图读取期间及时停止已被替换的导出任务。
+            try Task.checkCancellation()
+            // 剩余字节数包含用于识别超限的最后一个字节。
+            let remainingByteCount = stopByteCount - Int64(data.count)
+            // 单次最多读取六十四 KiB，限制临时块分配。
+            let chunkByteCount = Int(min(64 * 1_024, remainingByteCount))
+            // FileHandle 始终从同一已校验描述符继续读取。
+            guard let chunk = try fileHandle.read(upToCount: chunkByteCount), !chunk.isEmpty else {
+                // 空数据表示已经到达普通文件末尾。
+                break
+            }
+            // 追加当前块后再进入下一轮取消和上限检查。
+            data.append(chunk)
+        }
+        // 最后一块完成后也检查取消，避免返回已作废图片。
+        try Task.checkCancellation()
+        // 返回完整文件或刚好证明超限的上限加一字节。
+        return data
+    }
+
+    // 将即时 POSIX errno 复制成不会随线程状态变化的中文错误详情。
+    private static func posixReason(_ errorCode: Int32) -> String {
+        // strerror 返回系统本地化说明，立即构造 Swift 字符串保存副本。
+        String(cString: Darwin.strerror(errorCode))
+    }
+
+    // 使用 realpath 为既有文件或目录生成真实绝对地址。
+    private static func canonicalFileURL(_ url: URL) -> URL? {
+        // PATH_MAX 大小的固定缓冲区足以承接 macOS realpath 结果。
+        var canonicalPath = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        // 本地文件系统表示只在闭包作用域内有效。
+        let didResolve = url.withUnsafeFileSystemRepresentation { path in
+            // 非本地或无法表示的 URL 不能调用 realpath。
+            guard let path else { return false }
+            // 可变缓冲区保存零结尾真实路径。
+            return canonicalPath.withUnsafeMutableBufferPointer { buffer in
+                // 固定非空缓冲区应始终提供首地址。
+                guard let baseAddress = buffer.baseAddress else { return false }
+                // realpath 成功返回同一缓冲区指针。
+                return Darwin.realpath(path, baseAddress) != nil
+            }
+        }
+        // 不存在或无法解析的路径交给调用方采用安全回退。
+        guard didResolve else { return nil }
+        // 将完整真实路径转换为标准文件 URL。
+        return canonicalPath.withUnsafeBufferPointer { buffer in
+            // realpath 成功保证首地址是有效零结尾字符串。
+            URL(
+                fileURLWithFileSystemRepresentation: buffer.baseAddress!,
+                isDirectory: false,
+                relativeTo: nil
+            ).standardizedFileURL
+        }
+    }
+
+    // 判断真实候选路径是否严格位于真实文档目录内。
+    private static func isStrictDescendant(_ candidate: URL, of directory: URL) -> Bool {
+        // 根目录单独保留一个斜杠，其他目录补充分隔符防止相似前缀误命中。
+        let directoryPrefix = directory.path == "/" ? "/" : directory.path + "/"
+        // 图片路径必须包含完整目录分隔边界且不能等于目录自身。
+        return candidate.path.hasPrefix(directoryPrefix)
+    }
+}
+
 // 将首版支持的 Markdown 块安全映射为内联样式 HTML。
 private enum HTMLExportRenderer {
+    // 图片渲染策略按完整离线 HTML 与公众号兼容输出分离。
+    typealias ImageRenderer = (_ imageURL: URL, _ alt: String) -> String
+
     // 普通文本和属性值共用严格的 HTML 实体转义。
     static func escapeHTML(_ value: String) -> String {
         // 预留接近原文长度的容量，降低长文档扩容次数。
@@ -315,10 +946,55 @@ private enum HTMLExportRenderer {
         return escaped
     }
 
+    // 保持公众号既有 HTTP/HTTPS 图片输出，其余协议继续退化为替代文字。
+    static func renderWechatImage(_ imageURL: URL, _ alt: String) -> String {
+        // 替代文字始终先完成实体转义。
+        let safeAlt = escapeHTML(alt)
+        // 公众号兼容路径继续只接受原有 HTTP 与 HTTPS 白名单。
+        guard let source = safeURLString(imageURL, allowedSchemes: ["http", "https"]) else {
+            // data、file 和 javascript 等协议不进入目标属性。
+            return safeAlt
+        }
+        // 远程图片沿用原响应式结构，避免改变已公开的公众号载荷。
+        return
+            "<img src=\"\(escapeHTML(source))\" alt=\"\(safeAlt)\" style=\"display:block;max-width:100%;height:auto;margin:18px auto;border-radius:6px;\" loading=\"lazy\">"
+    }
+
+    // 把完整 HTML 中的远程图片转换为不自动联网的文字或显式链接。
+    static func renderOfflineImage(_ imageURL: URL, _ alt: String) -> String {
+        // 默认说明保留用户写下的替代文字。
+        let safeAlt = escapeHTML(alt.isEmpty ? "图片" : alt)
+        // 复用预览策略区分永久阻止的 HTTP 与可显式访问的 HTTPS。
+        switch EnhancedImageSourceResolver.remoteImageDecision(for: imageURL.absoluteString) {
+        case .blocked:
+            // HTTP 和无有效主机的地址仅保留说明，不输出可请求属性。
+            return "<span role=\"img\">已阻止远程图片：\(safeAlt)</span>"
+        case let .requiresConfirmation(request):
+            // HTTPS 只成为用户主动点击的普通链接，绝不成为 img src。
+            return
+                "<a href=\"\(escapeHTML(request.url.absoluteString))\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"color:#0969da;text-decoration:none;border-bottom:1px solid #54aeff;\">远程图片未自动加载：\(safeAlt)（\(escapeHTML(request.displayHost))）</a>"
+        case .notRemote:
+            // 没有可用本地上下文或协议非法时只保留可读替代文字。
+            return safeAlt
+        }
+    }
+
+    // 只供已验证本地图片生成 data img 标签。
+    static func renderEmbeddedImage(dataURL: String, alt: String) -> String {
+        // data URL 来自内部编码，仍统一执行属性转义保持边界稳定。
+        let safeSource = escapeHTML(dataURL)
+        // 替代文字来自 Markdown，必须严格转义引号和标签边界。
+        let safeAlt = escapeHTML(alt)
+        // 单文件图片沿用既有响应式尺寸与懒加载表现。
+        return
+            "<img src=\"\(safeSource)\" alt=\"\(safeAlt)\" style=\"display:block;max-width:100%;height:auto;margin:18px auto;border-radius:6px;\" loading=\"lazy\">"
+    }
+
     // 将 Markdown 文本渲染成不含外层文档标签的 HTML。
     static func renderFragment(
         _ markdown: String,
-        template: WechatExportTemplate = .simple
+        template: WechatExportTemplate = .simple,
+        imageRenderer: ImageRenderer
     ) -> String {
         // 统一 Windows 和旧 Mac 换行符，保证块识别稳定。
         let normalized =
@@ -366,7 +1042,13 @@ private enum HTMLExportRenderer {
             // 表格依赖下一行的分隔符，因此要在普通段落前识别。
             if let table = parseTable(lines: lines, start: index) {
                 // 输出带横向滚动容器的表格。
-                blocks.append(renderTable(header: table.header, rows: table.rows, template: template))
+                blocks.append(
+                    renderTable(
+                        header: table.header,
+                        rows: table.rows,
+                        template: template,
+                        imageRenderer: imageRenderer
+                    ))
                 // 一次消费完整表格范围。
                 index = table.nextIndex
                 continue
@@ -375,7 +1057,11 @@ private enum HTMLExportRenderer {
             // 识别一到六级 ATX 标题。
             if let heading = headingContent(line) {
                 // 标题正文允许安全的行内 Markdown。
-                let content = renderInline(heading.text, template: template)
+                let content = renderInline(
+                    heading.text,
+                    template: template,
+                    imageRenderer: imageRenderer
+                )
                 // 根据级别选择紧凑字号并保持统一中文排版。
                 let size = headingFontSize(heading.level)
                 // 一级标题居中，其余标题左对齐。
@@ -406,7 +1092,9 @@ private enum HTMLExportRenderer {
                 // 每个列表项独立解析行内样式。
                 let content =
                     items
-                    .map { "<li style=\"margin:4px 0;\">\(renderInline($0, template: template))</li>" }
+                    .map {
+                        "<li style=\"margin:4px 0;\">\(renderInline($0, template: template, imageRenderer: imageRenderer))</li>"
+                    }
                     .joined()
                 // 输出语义化无序列表。
                 blocks.append("<ul style=\"margin:14px 0;padding-left:1.5em;\">\(content)</ul>")
@@ -424,7 +1112,9 @@ private enum HTMLExportRenderer {
                 // 每个列表项独立解析行内样式。
                 let content =
                     items
-                    .map { "<li style=\"margin:4px 0;\">\(renderInline($0, template: template))</li>" }
+                    .map {
+                        "<li style=\"margin:4px 0;\">\(renderInline($0, template: template, imageRenderer: imageRenderer))</li>"
+                    }
                     .joined()
                 // 输出语义化有序列表。
                 blocks.append("<ol style=\"margin:14px 0;padding-left:1.7em;\">\(content)</ol>")
@@ -442,7 +1132,13 @@ private enum HTMLExportRenderer {
                 // 保留引用内部的显式换行。
                 let content =
                     quoteLines
-                    .map { renderInline($0, template: template) }
+                    .map {
+                        renderInline(
+                            $0,
+                            template: template,
+                            imageRenderer: imageRenderer
+                        )
+                    }
                     .joined(separator: "<br>")
                 // 用左边框形成公众号兼容的引用样式。
                 blocks.append("<blockquote style=\"\(template.quoteStyle)\">\(content)</blockquote>")
@@ -461,7 +1157,9 @@ private enum HTMLExportRenderer {
             // 普通软换行按空格连接，避免意外挤成一个单词。
             let paragraph = paragraphLines.joined(separator: " ")
             // 输出支持行内样式的正文段落。
-            blocks.append("<p style=\"\(template.paragraphStyle)\">\(renderInline(paragraph, template: template))</p>")
+            blocks.append(
+                "<p style=\"\(template.paragraphStyle)\">\(renderInline(paragraph, template: template, imageRenderer: imageRenderer))</p>"
+            )
         }
 
         // 按原文顺序输出块，并保留可读换行。
@@ -471,7 +1169,8 @@ private enum HTMLExportRenderer {
     // 通过系统 Markdown 解析器读取安全的行内语义。
     private static func renderInline(
         _ source: String,
-        template: WechatExportTemplate
+        template: WechatExportTemplate,
+        imageRenderer: ImageRenderer
     ) -> String {
         // 仅启用行内语法，避免输入片段改变外层块结构。
         guard
@@ -495,16 +1194,10 @@ private enum HTMLExportRenderer {
             // 可见文本始终先做实体转义。
             let safeText = escapeHTML(text)
 
-            // 图片只接受 http 或 https 地址，危险协议退化为替代文字。
+            // 图片由当前导出目标的独立策略生成完整安全标签或占位。
             if let imageURL = run.imageURL {
-                if let source = safeURLString(imageURL, allowedSchemes: ["http", "https"]) {
-                    // 图片地址和替代文字都经过属性转义。
-                    html +=
-                        "<img src=\"\(escapeHTML(source))\" alt=\"\(safeText)\" style=\"display:block;max-width:100%;height:auto;margin:18px auto;border-radius:6px;\" loading=\"lazy\">"
-                } else {
-                    // 不安全图片仅保留可见说明，不发起资源请求。
-                    html += safeText
-                }
+                // 策略接收原始替代文字并负责属性转义，避免双重实体编码。
+                html += imageRenderer(imageURL, text)
                 continue
             }
 
@@ -766,12 +1459,15 @@ private enum HTMLExportRenderer {
     private static func renderTable(
         header: [String],
         rows: [[String]],
-        template: WechatExportTemplate
+        template: WechatExportTemplate,
+        imageRenderer: ImageRenderer
     ) -> String {
         // 表头使用加粗和浅灰背景。
         let headerHTML =
             header
-            .map { "<th style=\"\(template.tableHeaderStyle)\">\(renderInline($0, template: template))</th>" }
+            .map {
+                "<th style=\"\(template.tableHeaderStyle)\">\(renderInline($0, template: template, imageRenderer: imageRenderer))</th>"
+            }
             .joined()
         // 每个表体单元格独立渲染行内样式。
         let rowsHTML =
@@ -779,7 +1475,9 @@ private enum HTMLExportRenderer {
             .map { row in
                 let cells =
                     row
-                    .map { "<td style=\"\(template.tableCellStyle)\">\(renderInline($0, template: template))</td>" }
+                    .map {
+                        "<td style=\"\(template.tableCellStyle)\">\(renderInline($0, template: template, imageRenderer: imageRenderer))</td>"
+                    }
                     .joined()
                 return "<tr>\(cells)</tr>"
             }
@@ -834,7 +1532,7 @@ enum ExportSupportSelfCheck {
         if !document.contains("href=\"https://example.com?a=1&amp;b=2\"") { failures.append("安全链接未输出") }
         // javascript 协议绝不能成为 href。
         if document.contains("href=\"javascript:") { failures.append("危险链接协议未过滤") }
-        // data 图片绝不能成为 src。
+        // 用户输入的 data 图片绝不能成为 src。
         if document.contains("src=\"data:") { failures.append("危险图片协议未过滤") }
         // 两套公众号模板必须执行相同的危险协议过滤。
         for (name, html) in [("简洁", simple), ("技术文", technical)] {
@@ -843,13 +1541,29 @@ enum ExportSupportSelfCheck {
                 failures.append("\(name)模板危险协议未过滤")
             }
         }
-        // 合法远程图片应保留响应式结构。
-        if !document.contains("src=\"https://example.com/image.png\"") { failures.append("安全图片未输出") }
+        // 完整 HTML 的 HTTPS 图片只能保留显式链接，不能自动加载。
+        if document.contains("src=\"https://example.com/image.png\"")
+            || !document.contains("href=\"https://example.com/image.png\"")
+        {
+            failures.append("完整 HTML 远程图片未保持离线")
+        }
+        // 公众号载荷继续保留既有远程图片结构，避免兼容性回退。
+        if !simple.contains("src=\"https://example.com/image.png\"")
+            || !technical.contains("src=\"https://example.com/image.png\"")
+        {
+            failures.append("公众号远程图片兼容性回退")
+        }
         // 表格应输出关键语义标签。
         if !document.contains("<table ") || !document.contains("<thead>") { failures.append("表格结构缺失") }
         // 完整文档必须具有基本 HTML 壳层和 CSP。
         if !document.contains("<!doctype html>") || !document.contains("Content-Security-Policy") {
             failures.append("完整文档壳层缺失")
+        }
+        // 完整文档 CSP 只允许内部 data 图片，不能授予 HTTP 或 HTTPS 图片权限。
+        if !document.contains("img-src data:") || document.contains("img-src https:")
+            || document.contains("img-src http:")
+        {
+            failures.append("完整文档 CSP 允许网络图片")
         }
         // 公众号输出必须是内联样式片段而非完整页面。
         if !simple.contains("<section style=") || simple.contains("<!doctype html>") { failures.append("公众号片段结构错误") }

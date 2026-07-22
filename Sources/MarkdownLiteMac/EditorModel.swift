@@ -3,6 +3,16 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+// 表示一次后台 HTML 导出结束后可安全回传主线程的有限结果。
+private enum BackgroundHTMLExportResult: Sendable {
+    // 所有本地图片和 HTML 已经完整原子写入目标文件。
+    case success
+    // 标签关闭或下一次导出主动取消了当前任务。
+    case cancelled
+    // 只把可展示的错误说明带回界面，不跨 actor 传递任意错误对象。
+    case failure(String)
+}
+
 // 管理一个标签自己的正文、预览、编码、草稿和保存状态。
 @MainActor
 final class EditorModel: ObservableObject, Identifiable {
@@ -52,6 +62,8 @@ final class EditorModel: ObservableObject, Identifiable {
     weak var workspace: WorkspaceModel?
     // 所有标签共享同一支撑层，但草稿键由 URL 或标签 UUID 隔离。
     private let documentStore: DocumentSupportStore
+    // 最近文件写入通过可注入闭包隔离，测试可以稳定复现索引失败而不破坏真实文件保存。
+    private let recordRecentDocument: (URL) throws -> Void
     // 保存快照用于外部修改核对和 dirty 基线。
     private var saveState: DocumentSaveState
     // 保存与最后一次打开或保存原始字节对应的可信磁盘指纹。
@@ -70,6 +82,8 @@ final class EditorModel: ObservableObject, Identifiable {
     private var draftTimer: Timer?
     // 自动草稿完整编码和磁盘写入在后台任务执行。
     private var draftWriteTask: Task<Void, Never>?
+    // HTML 图片读取、编码和原子写入使用独立后台任务，避免阻塞编辑输入。
+    private var exportTask: Task<Void, Never>?
 
     // 保留旧调用方式，实际应用由 WorkspaceModel 注入共享存储。
     convenience init() {
@@ -111,12 +125,19 @@ final class EditorModel: ObservableObject, Identifiable {
         status: String,
         documentStore: DocumentSupportStore,
         externalFileSnapshot: ExternalFileSnapshot? = nil,
-        initialExternalChangeState: ExternalDocumentChangeState? = nil
+        initialExternalChangeState: ExternalDocumentChangeState? = nil,
+        recordRecentDocument: ((URL) throws -> Void)? = nil
     ) {
         // 先保存稳定标签身份。
         self.id = id
         // 保存共享支撑层引用。
         self.documentStore = documentStore
+        // 生产环境默认写入正式最近文件索引，测试可注入确定性失败闭包。
+        self.recordRecentDocument =
+            recordRecentDocument ?? { fileURL in
+                // 默认路径保持既有存储实现和排序语义。
+                try documentStore.recordRecentDocument(fileURL)
+            }
         // 初始化正文，不触发 didSet。
         self.text = text
         // 先用局部值规范化真实文件路径，避免初始化期间读取 self。
@@ -465,8 +486,31 @@ final class EditorModel: ObservableObject, Identifiable {
         status = "正在编辑…"
     }
 
+    // 原生编辑器只在撤销或重做完成后调用，用完整保存快照精确修正 dirty 状态。
+    func reconcileDirtyAfterUndoRedo() {
+        // 普通输入仍走常量时间 markChanged；这里仅为撤销栈回到保存内容的低频路径做全文核对。
+        isDirty = saveState.reconcile(text: text, fileURL: currentFileURL)
+        // 仍与保存快照不同时保留当前草稿节流和恢复能力。
+        guard !isDirty else { return }
+        // 回到保存快照后停止尚未触发的草稿计时器。
+        draftTimer?.invalidate()
+        // 清除计时器引用，避免已失效计时器被误认为当前请求。
+        draftTimer = nil
+        // 取消可能已经捕获旧正文的后台草稿任务。
+        draftWriteTask?.cancel()
+        // 清除旧任务引用，后续编辑只跟踪自己的新任务。
+        draftWriteTask = nil
+        // 删除已落盘旧草稿并推进同一草稿键的单调屏障，阻止更早后台写入复活。
+        try? documentStore.removeDraft(
+            for: currentFileURL,
+            untitledID: currentFileURL == nil ? id : nil
+        )
+    }
+
     // 捕获当前状态并启动不阻塞主 actor 的自动草稿写入。
     private func startBackgroundDraftWrite() {
+        // 已经撤销回保存快照时，忽略计时器先触发但稍后才进入主 actor 的旧回调。
+        guard isDirty else { return }
         // 新任务开始前取消旧任务的状态回写。
         draftWriteTask?.cancel()
         // String 写时复制让主线程只获取低成本正文快照。
@@ -533,19 +577,31 @@ final class EditorModel: ObservableObject, Identifiable {
             }
             // 已取消任务不再消耗解析 CPU。
             guard !Task.isCancelled else { return }
-            // detached 任务让大文档解析离开主线程。
-            let result = await Task.detached(priority: .userInitiated) {
+            // detached 任务让大文档解析离开主线程，并返回可由取消路径丢弃的可选结果。
+            let parseTask = Task.detached(priority: .userInitiated) { () -> ([EnhancedPreviewBlock], Double)? in
+                // 外层任务在 detached 启动前取消时不进入解析器。
+                guard !Task.isCancelled else { return nil }
                 // 单调时钟记录本次真实解析耗时。
                 let startedAt = ProcessInfo.processInfo.systemUptime
                 // 线性扫描生成增强块。
                 let blocks = EnhancedMarkdownParser.parse(markdown)
+                // 解析器响应取消后不把不完整结果和耗时交给界面。
+                guard !Task.isCancelled else { return nil }
                 // 换算成毫秒供当前标签状态栏展示。
                 let milliseconds = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
                 // 一次返回块和耗时。
                 return (blocks, milliseconds)
-            }.value
+            }
+            // 外层节流任务取消时显式传播给不继承取消状态的 detached 解析任务。
+            let result = await withTaskCancellationHandler {
+                // 正常路径等待后台解析完成。
+                await parseTask.value
+            } onCancel: {
+                // 新输入或标签关闭会立即请求解析器停止长循环。
+                parseTask.cancel()
+            }
             // 解析期间取消时丢弃结果。
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, let result else { return }
             // 只有同一标签最新版本可以回写。
             guard let self, self.previewGeneration == generation else { return }
             // 更新当前标签预览块。
@@ -976,12 +1032,22 @@ final class EditorModel: ObservableObject, Identifiable {
             )
             // 清理目标路径可能残留的同内容草稿。
             try? documentStore.removeDraft(for: destination)
-            // 保存成功进入最近文件列表。
-            try documentStore.recordRecentDocument(destination)
+            // 最近文件索引属于保存后的辅助元数据，失败不得反转已经落盘的成功结果。
+            let recentDocumentWasUpdated: Bool
+            // 单独隔离可能失败的索引写入，避免落入下方真实保存失败分支并重新制造草稿。
+            do {
+                // 使用默认存储实现或测试注入闭包更新最近文件顺序。
+                try recordRecentDocument(destination)
+                // 记录辅助索引已经同步完成。
+                recentDocumentWasUpdated = true
+            } catch {
+                // 文件正文已经成功落盘，仅把辅助索引失败留给状态栏反馈。
+                recentDocumentWasUpdated = false
+            }
             // 通知工作区刷新会话路径和最近列表。
             workspace?.documentDidSave(self)
-            // 明确反馈真实文件已保存。
-            status = "文件已保存"
+            // 索引失败时仍明确确认文件安全落盘，同时提示最近文件列表可能未更新。
+            status = recentDocumentWasUpdated ? "文件已保存" : "文件已保存，最近文件更新失败"
             // 返回保存成功。
             return true
         } catch ExternalChangeSupportError.changedBeforeWrite(let state) {
@@ -1002,18 +1068,79 @@ final class EditorModel: ObservableObject, Identifiable {
 
     // 导出当前标签为完整 HTML 文件。
     func exportHTML() {
-        do {
-            // 以当前标签标题生成页面标题和默认文件名。
-            let exportedURL = try ExportSupport.presentHTMLSavePanel(
-                markdown: text,
-                title: documentTitle,
+        // 保存面板只在主线程选择目标，不执行图片读取或 Base64 编码。
+        guard
+            let destination = ExportSupport.chooseHTMLDestination(
                 suggestedFilename: documentTitle
             )
-            // 用户确认保存后展示目标文件名。
-            if let exportedURL { status = "已导出：\(exportedURL.lastPathComponent)" }
-        } catch {
-            // 导出失败不影响 Markdown 草稿。
-            status = "导出失败：\(error.localizedDescription)"
+        else {
+            // 用户取消时保持原状态，不创建文件或启动后台任务。
+            return
+        }
+        // 保存旧请求句柄，新请求必须等它完全结束后才能提交同一目标。
+        let previousExportTask = exportTask
+        // 新导出开始前停止同一标签尚未完成的旧请求。
+        previousExportTask?.cancel()
+        // String 写时复制提供本次导出的稳定正文快照。
+        let capturedText = text
+        // 标题和默认文件名使用用户确认时的文档名称。
+        let capturedTitle = documentTitle
+        // 本地图只允许相对于本次文档位置解析。
+        let capturedDocumentURL = currentFileURL
+        // 立即反馈当前任务已经进入后台处理。
+        status = "正在导出离线 HTML…"
+
+        // 主 actor 任务先串行化同一标签的导出，再等待后台结果并更新状态。
+        exportTask = Task { [weak self] in
+            // 被取消的旧请求必须完全退出，确保它不能晚于当前请求覆盖相同目标。
+            if let previousExportTask {
+                // 等待只发生在协作式任务上，不阻塞主线程事件循环。
+                await previousExportTask.value
+            }
+            // 排队期间又被更新请求替换时不再创建新的后台写入。
+            guard !Task.isCancelled else { return }
+            // detached 任务负责全部解析、图片读取和磁盘写入。
+            let writeTask = Task.detached(priority: .userInitiated) { () -> BackgroundHTMLExportResult in
+                do {
+                    // 纯写入 API 会验证全部本地图并在成功后原子替换目标。
+                    try ExportSupport.writePortableHTML(
+                        markdown: capturedText,
+                        title: capturedTitle,
+                        documentURL: capturedDocumentURL,
+                        to: destination
+                    )
+                    // 只有完整写入结束才返回成功。
+                    return .success
+                } catch is CancellationError {
+                    // 标签关闭或新请求替换当前任务时不展示错误。
+                    return .cancelled
+                } catch {
+                    // 后台只回传可直接展示的本地化说明。
+                    return .failure(error.localizedDescription)
+                }
+            }
+            // 外层任务取消时显式传播给不继承取消状态的 detached 写入任务。
+            let result = await withTaskCancellationHandler {
+                // 正常路径等待后台导出结束。
+                await writeTask.value
+            } onCancel: {
+                // 新导出或标签关闭会阻止旧请求继续写入。
+                writeTask.cancel()
+            }
+            // 被替换的请求不能覆盖当前标签的新状态。
+            guard !Task.isCancelled, let self else { return }
+            // 按真实结果给出不会误导用户的数据状态。
+            switch result {
+            case .success:
+                // 文件已经完成原子写入，可以展示实际名称。
+                self.status = "已导出离线 HTML：\(destination.lastPathComponent)"
+            case .cancelled:
+                // 正常取消不改变当前状态栏。
+                return
+            case let .failure(message):
+                // 导出失败不影响 Markdown 正文和恢复草稿。
+                self.status = "导出失败：\(message)"
+            }
         }
     }
 
@@ -1033,6 +1160,8 @@ final class EditorModel: ObservableObject, Identifiable {
         draftWriteTask?.cancel()
         // 停止预览任务，避免无界面回写。
         previewTask?.cancel()
+        // 停止尚未完成的 HTML 图片读取和目标写入。
+        exportTask?.cancel()
     }
 
     // 当前文档标题去掉扩展名供 HTML 使用。
