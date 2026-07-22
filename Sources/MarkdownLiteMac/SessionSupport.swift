@@ -14,6 +14,21 @@ struct WorkspaceSessionState: Codable, Equatable {
     let documents: [WorkspaceSessionDocument]
     // 活动 UUID 不存在时恢复首个有效标签。
     let activeDocumentID: UUID?
+
+    // 判断会话是否具备可安全尝试恢复的最小身份布局。
+    var hasValidDocumentIdentityLayout: Bool {
+        // 正常工作区始终至少有一个标签，空数组不能覆盖仍可能有效的上一代。
+        guard !documents.isEmpty else { return false }
+        // UUID 是未命名草稿的唯一入口，恢复前必须保证整组身份不重复。
+        var documentIDs = Set<UUID>()
+        // 逐项登记 UUID，任何重复都让本代整体失去确定恢复语义。
+        for document in documents {
+            // 插入失败表示两个标签会竞争同一草稿和活动标签身份。
+            guard documentIDs.insert(document.id).inserted else { return false }
+        }
+        // 非空且 UUID 全部唯一时才允许工作区继续解析具体文档。
+        return true
+    }
 }
 
 // 返回会话内容以及本次是否使用上一代恢复。
@@ -189,6 +204,26 @@ final class WorkspaceSessionStore {
         }
         // 两代都不存在属于首次启动，由工作区创建首个未命名标签。
         return nil
+    }
+
+    // 单独读取上一代，供工作区在当前代可解码但无法实际恢复标签时继续回退。
+    func loadPreviousGeneration() throws -> WorkspaceSessionState? {
+        // 上一代不存在时由工作区决定创建首次标签或保留当前结论。
+        guard fileManager.fileExists(atPath: previousSessionFileURL.path) else { return nil }
+        // 仍走完整读取和解码，损坏上一代不能被误当成安全候选。
+        return try loadSession(at: previousSessionFileURL)
+    }
+
+    // 从上一代恢复后只修复 current，不把语义失效的旧 current 晋升并覆盖恢复来源。
+    func saveRecoveredCurrent(_ state: WorkspaceSessionState) throws {
+        // 修复前确保产品目录仍可访问。
+        try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        // 在内存完成编码，失败时 current 和 previous 都保持原样。
+        let data = try encoder.encode(state)
+        // previous 必须仍然完整可解码，才能作为本次修复的可信恢复来源。
+        _ = try loadSession(at: previousSessionFileURL)
+        // 原子替换 current，同时让 previous 字节保持不变供再次回退。
+        try data.write(to: sessionFileURL, options: [.atomic])
     }
 
     // 归档全部不可恢复的现有代，并用调用方当前内存状态安装有效 current。

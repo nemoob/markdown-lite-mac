@@ -233,6 +233,105 @@ struct WorkspaceModelReliabilityTests {
         #expect(try sessionStore.load() == previousSession)
     }
 
+    // 空 current 可解码但没有标签时必须先回退 previous。
+    @Test("空当前会话回退上一代")
+    @MainActor
+    func testEmptyCurrentSessionFallsBackToPrevious() throws {
+        // 复用完整工作区夹具，current 只提供一个明确空数组。
+        try assertSemanticCurrentFallsBackToPrevious { _ in
+            // 空数组不能覆盖仍可恢复的上一代未命名标签。
+            WorkspaceSessionState(documents: [], activeDocumentID: nil)
+        }
+    }
+
+    // 重复 UUID 会让未命名草稿归属不确定，必须整体拒绝 current。
+    @Test("重复 UUID 当前会话回退上一代")
+    @MainActor
+    func testDuplicateCurrentSessionIDsFallBackToPrevious() throws {
+        // 复用完整工作区夹具并构造两个相同标签身份。
+        try assertSemanticCurrentFallsBackToPrevious { _ in
+            // 使用固定重复 UUID 让失败原因与 previous 身份完全独立。
+            let duplicateID = UUID(uuidString: "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD")!
+            // 两个描述竞争同一 UUID 时不能按数组顺序猜测草稿入口。
+            return WorkspaceSessionState(
+                documents: [
+                    WorkspaceSessionDocument(id: duplicateID, fileURL: nil),
+                    WorkspaceSessionDocument(id: duplicateID, fileURL: nil),
+                ],
+                activeDocumentID: duplicateID
+            )
+        }
+    }
+
+    // current 标签全部失效且没有草稿时必须继续尝试 previous。
+    @Test("无可恢复描述的当前会话回退上一代")
+    @MainActor
+    func testUnrestorableCurrentSessionFallsBackToPrevious() throws {
+        // 复用完整工作区夹具并把失效路径放在隔离目录内。
+        try assertSemanticCurrentFallsBackToPrevious { root in
+            // 唯一描述指向不存在且没有草稿的本地文件。
+            let missingURL = root.appendingPathComponent("missing-current.md", isDirectory: false)
+            // UUID 唯一且 JSON 有效，确保本例只验证实际 descriptor 可恢复性。
+            let missingID = UUID(uuidString: "EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE")!
+            // 构造身份布局有效、但工作区无法恢复任何标签的 current。
+            return WorkspaceSessionState(
+                documents: [WorkspaceSessionDocument(id: missingID, fileURL: missingURL)],
+                activeDocumentID: missingID
+            )
+        }
+    }
+
+    // 正常 current 仍应保持最高优先级，不能因新增语义回退错误采用 previous。
+    @Test("有效当前会话优先于上一代")
+    @MainActor
+    func testValidCurrentSessionRemainsPreferred() throws {
+        // 创建本次优先级验证独享目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 会话和草稿使用同一隔离产品目录。
+        let documentStore = DocumentSupportStore(rootDirectory: root)
+        // 会话存储用于建立 previous 与 current。
+        let sessionStore = WorkspaceSessionStore(rootDirectory: root)
+        // previous 使用独立未命名标签身份。
+        let previousID = UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!
+        // current 使用另一个唯一身份证明优先级。
+        let currentID = UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")!
+        // 为 previous 标签建立可恢复正文。
+        _ = try documentStore.saveDraft("上一代正文", for: nil, untitledID: previousID)
+        // 为 current 标签建立不同正文。
+        _ = try documentStore.saveDraft("当前代正文", for: nil, untitledID: currentID)
+        // 首次保存建立未来 previous。
+        try sessionStore.save(
+            WorkspaceSessionState(
+                documents: [WorkspaceSessionDocument(id: previousID, fileURL: nil)],
+                activeDocumentID: previousID
+            )
+        )
+        // 第二次保存建立正常 current。
+        try sessionStore.save(
+            WorkspaceSessionState(
+                documents: [WorkspaceSessionDocument(id: currentID, fileURL: nil)],
+                activeDocumentID: currentID
+            )
+        )
+
+        // 正式初始化必须先选择正常 current。
+        let workspace = WorkspaceModel(
+            documentStore: documentStore,
+            sessionStore: sessionStore,
+            restoresSession: true
+        )
+        // 测试结束前停止标签延迟任务。
+        defer { workspace.documents.forEach { $0.prepareForClose() } }
+        // 活动身份必须来自 current 而非 previous。
+        #expect(workspace.activeDocumentID == currentID)
+        // 正文必须继续由 current 的同 UUID 草稿恢复。
+        #expect(workspace.activeDocument?.text == "当前代正文")
+        // 工作区反馈不能误报发生了上一代回退。
+        #expect(workspace.status == "已恢复 1 个标签")
+    }
+
     // 双代会话都损坏时只能创建内存编辑状态，不能把空会话覆盖到磁盘。
     @Test("双代会话损坏时不覆盖恢复证据")
     @MainActor
@@ -612,6 +711,63 @@ struct WorkspaceModelReliabilityTests {
             currentEvidence,
             previousEvidence
         )
+    }
+
+    // 建立有效 previous、语义失效 current 和未命名草稿，并验证完整工作区回退闭环。
+    @MainActor
+    private func assertSemanticCurrentFallsBackToPrevious(
+        makeCurrentSession: (URL) -> WorkspaceSessionState
+    ) throws {
+        // 每个矩阵用例使用独立目录，避免并行测试共享任何恢复文件。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 文档存储负责提供 previous 未命名标签的正文入口。
+        let documentStore = DocumentSupportStore(rootDirectory: root)
+        // 会话存储负责建立真实 current 与 previous 双代布局。
+        let sessionStore = WorkspaceSessionStore(rootDirectory: root)
+        // 使用固定 UUID 证明回退后仍连接同一未命名草稿。
+        let recoveredID = UUID(uuidString: "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC")!
+        // 为 previous 标签保存不可由新 UUID 猜测的正文。
+        _ = try documentStore.saveDraft("上一代未命名正文", for: nil, untitledID: recoveredID)
+        // 构造必须在所有矩阵中保持可恢复的 previous。
+        let previousSession = WorkspaceSessionState(
+            documents: [WorkspaceSessionDocument(id: recoveredID, fileURL: nil)],
+            activeDocumentID: recoveredID
+        )
+        // 当前代由每个测试分别覆盖空、重复和全部失效描述。
+        let currentSession = makeCurrentSession(root)
+        // 首次保存建立未来 previous。
+        try sessionStore.save(previousSession)
+        // 第二次保存把语义失效候选放到 current。
+        try sessionStore.save(currentSession)
+        // 定位必须保持不变的 previous 文件。
+        let previousURL = root.appendingPathComponent("WorkspaceSession.previous.json", isDirectory: false)
+        // 捕获回退前字节，验证修复 current 不轮换恢复来源。
+        let previousEvidence = try Data(contentsOf: previousURL)
+
+        // 正式工作区初始化先尝试 current，再选择可恢复 previous。
+        let workspace = WorkspaceModel(
+            documentStore: documentStore,
+            sessionStore: sessionStore,
+            restoresSession: true
+        )
+        // 测试结束前停止全部标签延迟任务。
+        defer { workspace.documents.forEach { $0.prepareForClose() } }
+        // 最终只能发布 previous 中的唯一标签。
+        #expect(workspace.documents.map(\.id) == [recoveredID])
+        // 活动 UUID 必须保持 previous 的未命名草稿入口。
+        #expect(workspace.activeDocumentID == recoveredID)
+        // 未命名正文必须通过同一 UUID 完整恢复。
+        #expect(workspace.activeDocument?.text == "上一代未命名正文")
+        // 工作区必须明确反馈本次采用了 previous。
+        #expect(workspace.status == "已从上一代会话恢复 1 个标签")
+        // 修复后的 current 必须采用最终选中的规范化 previous 状态。
+        #expect(try sessionStore.load() == previousSession)
+        // previous 模型仍必须保持为同一恢复来源。
+        #expect(try sessionStore.loadPreviousGeneration() == previousSession)
+        // previous 原始字节必须逐字节不变，防止语义失效 current 覆盖它。
+        #expect(try Data(contentsOf: previousURL) == previousEvidence)
     }
 
     // 为每个测试创建唯一目录，避免并行执行时互相覆盖。

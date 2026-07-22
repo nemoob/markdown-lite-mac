@@ -6,6 +6,75 @@ import Testing
 // 验证会话当前代与上一代在兼容、损坏和缺失场景下的恢复规则。
 @Suite("会话双代恢复")
 struct SessionSupportRecoveryTests {
+    // 会话恢复前必须拒绝空标签数组和重复 UUID，同时继续接受正常唯一身份。
+    @Test("会话身份布局拒绝空数组和重复 UUID")
+    func testSessionIdentityLayoutValidation() {
+        // 使用固定 UUID 构造可逐项核对的身份矩阵。
+        let firstID = UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!
+        // 第二个 UUID 证明多个不同标签仍属于有效布局。
+        let secondID = UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")!
+        // 空会话不能成为覆盖上一代的恢复选择。
+        let emptyState = WorkspaceSessionState(documents: [], activeDocumentID: nil)
+        // 两个标签复用同一 UUID 会竞争未命名草稿入口。
+        let duplicateState = WorkspaceSessionState(
+            documents: [
+                WorkspaceSessionDocument(id: firstID, fileURL: nil),
+                WorkspaceSessionDocument(id: firstID, fileURL: nil),
+            ],
+            activeDocumentID: firstID
+        )
+        // 非空且 UUID 唯一的正常会话必须继续兼容。
+        let validState = WorkspaceSessionState(
+            documents: [
+                WorkspaceSessionDocument(id: firstID, fileURL: nil),
+                WorkspaceSessionDocument(id: secondID, fileURL: nil),
+            ],
+            activeDocumentID: secondID
+        )
+
+        // 空数组不具备任何可恢复身份。
+        #expect(!emptyState.hasValidDocumentIdentityLayout)
+        // 重复 UUID 必须整体拒绝，不能按数组顺序猜测草稿归属。
+        #expect(!duplicateState.hasValidDocumentIdentityLayout)
+        // 正常多标签布局应通过最小身份校验。
+        #expect(validState.hasValidDocumentIdentityLayout)
+    }
+
+    // 从上一代修复 current 时必须保持上一代原始字节不变。
+    @Test("上一代恢复只修复当前代")
+    func testRecoveredCurrentSavePreservesPreviousBytes() throws {
+        // 创建本次测试独享的会话目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 创建正式会话存储。
+        let store = WorkspaceSessionStore(rootDirectory: root)
+        // 构造必须持续保留的上一代会话。
+        let previousState = makeState(id: UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!)
+        // 可解码空 current 用于模拟语义失效而非 JSON 损坏。
+        let emptyCurrent = WorkspaceSessionState(documents: [], activeDocumentID: nil)
+        // 首次保存建立未来的 previous。
+        try store.save(previousState)
+        // 第二次保存建立可解码但不可恢复的 current。
+        try store.save(emptyCurrent)
+        // 定位固定 previous 文件。
+        let previousURL = root.appendingPathComponent("WorkspaceSession.previous.json", isDirectory: false)
+        // 保存修复前原始字节，证明恢复来源不会被轮换覆盖。
+        let previousEvidence = try Data(contentsOf: previousURL)
+        // 单独读取 API 必须返回实际上一代。
+        #expect(try store.loadPreviousGeneration() == previousState)
+
+        // 模拟工作区明确选择 previous 后修复 current。
+        try store.saveRecoveredCurrent(previousState)
+
+        // 正常加载现在必须直接得到修复后的 current。
+        #expect(try store.load() == previousState)
+        // previous 的模型仍必须保持相同恢复来源。
+        #expect(try store.loadPreviousGeneration() == previousState)
+        // previous 字节必须逐字节不变，不能被空 current 污染。
+        #expect(try Data(contentsOf: previousURL) == previousEvidence)
+    }
+
     // v0.7 只有当前代文件时必须直接加载，并在首次新保存时成为上一代。
     @Test("兼容 v0.7 单代会话")
     func testLegacyCurrentSessionLoadsAndRotatesOnSave() throws {
