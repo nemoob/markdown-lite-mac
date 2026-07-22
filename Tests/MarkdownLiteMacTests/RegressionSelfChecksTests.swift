@@ -1,0 +1,101 @@
+import Foundation
+import Testing
+
+@testable import MarkdownLiteMac
+
+// 将既有无界面自检纳入标准 Swift Testing 发现和报告流程。
+@Suite("既有模块标准回归")
+struct RegressionSelfChecksTests {
+    // 文档读写、编码、草稿、最近文件和 dirty 快照必须全部通过。
+    @Test("文档支撑层")
+    func testDocumentSupportSelfCheck() throws {
+        // 复用正式隔离自检实现。
+        let report = try DocumentSupportSelfCheck.run()
+        // 当前至少覆盖六条持久化主路径。
+        #expect(report.passedChecks.count >= 6)
+    }
+
+    // 会话顺序和活动标签必须可跨启动往返。
+    @Test("会话持久化")
+    func testSessionSupportSelfCheck() throws {
+        // 运行隔离会话持久化自检。
+        let result = try SessionSupportSelfCheck.run()
+        // 稳定通过标记应说明恢复成功。
+        #expect(result.contains("恢复通过"))
+    }
+
+    // 多标签、独立草稿和失效文件回退必须通过。
+    @Test("多标签工作区")
+    @MainActor
+    func testWorkspaceModelSelfCheck() throws {
+        // 工作区模型属于主 actor，测试在相同隔离域执行。
+        let result = try WorkspaceModelSelfCheck.run()
+        // 稳定通过标记应包含多标签核心能力。
+        #expect(result.contains("多标签去重"))
+    }
+
+    // 图片相对路径、重名、类型和穿越保护必须通过。
+    @Test("图片资源安全")
+    func testAssetSupportSelfCheck() {
+        // 关闭标准输出，只消费结构化通过数量。
+        let passedChecks = AssetSupportSelfCheck.run(printResults: false)
+        // 当前图片模块包含十条安全和兼容性检查。
+        #expect(passedChecks >= 10)
+    }
+
+    // HTML 与公众号两套模板必须保持安全输出。
+    @Test("导出安全")
+    func testExportSupportSelfCheck() {
+        // 导出自检返回所有失败原因。
+        let failures = ExportSupportSelfCheck.run()
+        // 空数组表示所有安全与模板断言通过。
+        #expect(failures.isEmpty)
+    }
+
+    // Markdown 结构识别和两档长文档性能目标必须分别进入测试报告。
+    @Test("Markdown 结构与性能")
+    func testMarkdownStructureAndPerformance() {
+        // 关闭内部硬中止，让 Swift Testing 分别报告每个失败指标。
+        let report = EnhancedMarkdownSelfCheck.run(
+            printResults: false,
+            enforcePerformanceTargets: false
+        )
+        // 增强块类型样例必须保持完整识别。
+        #expect(report.blockTypesValid)
+        // 约 200KB 文档必须低于 50ms 目标。
+        #expect(report.mediumDocument.passed)
+        // 约 1MB 文档必须低于 200ms 目标。
+        #expect(report.largeDocument.passed)
+    }
+
+    // 文档末尾空行必须可以通过标题快捷键直接开始新标题。
+    @Test("EOF 空行标题格式")
+    func testHeadingFormattingAtTrailingEmptyLine() {
+        // 构造以换行结尾的常见回车后编辑场景。
+        let source = "正文\n"
+        // 光标位于换行后的零长度末行。
+        let selection = NSRange(location: (source as NSString).length, length: 0)
+        // 生成二级标题格式编辑。
+        let edit = MarkdownFormattingSupport.edit(
+            in: source,
+            selection: selection,
+            command: .heading(level: 2)
+        )
+        // 格式支持必须返回可执行编辑。
+        #expect(edit != nil)
+        // 生成失败时停止后续解包，前一断言会报告原因。
+        guard let edit else { return }
+        // 末行零长度范围必须被标题标记替换。
+        #expect(edit.replacementRange == selection)
+        // 二级标题标记包含两个井号和一个空格。
+        #expect(edit.replacement == "## ")
+        // 应用与 NSTextView 相同的单次替换。
+        let result = NSMutableString(string: source)
+        // 把格式编辑写入末尾空行。
+        result.replaceCharacters(in: edit.replacementRange, with: edit.replacement)
+        // 最终正文必须保留原换行并追加标题标记。
+        #expect(result as String == "正文\n## ")
+        // 光标应落在标题标记之后供用户立即输入。
+        #expect(edit.selectionAfterEdit == NSRange(location: selection.location + 3, length: 0))
+    }
+}

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="120" y1="80" x2="900" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2F6BFF"/>
+      <stop offset="1" stop-color="#7047EB"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="220" fill="url(#background)"/>
+  <g>
+    <path d="M258 190h458c40 0 72 32 72 72v584c0 40-32 72-72 72H258c-40 0-72-32-72-72V262c0-40 32-72 72-72Z" fill="#1B2E68" opacity="0.22"/>
+    <path d="M258 174h360l154 154v502c0 31-25 56-56 56H258c-31 0-56-25-56-56V230c0-31 25-56 56-56Z" fill="#FFFFFF"/>
+    <path d="M618 174v116c0 21 17 38 38 38h116L618 174Z" fill="#DDE7FF"/>
+  </g>
+  <path d="M334 422h54l-13 78h85l13-78h54l-13 78h69l-9 52h-69l-14 82h69l-9 52h-69l-13 78h-54l13-78h-85l-13 78h-54l13-78h-69l9-52h69l14-82h-69l9-52h69l13-78Zm32 130-14 82h85l14-82h-85Z" fill="#315FCB"/>
+  <path d="M596 474h45l57 87 57-87h45v210h-51V557l-51 77h-2l-50-76v126h-50V474Z" fill="#7047EB"/>
+</svg>

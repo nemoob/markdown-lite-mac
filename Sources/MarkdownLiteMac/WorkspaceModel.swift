@@ -1,0 +1,592 @@
+import AppKit
+import Foundation
+import SwiftUI
+import UniformTypeIdentifiers
+
+// 管理多标签顺序、活动标签、文件去重和会话恢复。
+@MainActor
+final class WorkspaceModel: ObservableObject {
+    // 标签数组顺序直接对应界面标签顺序。
+    @Published private(set) var documents: [EditorModel] = []
+    // 活动 UUID 独立持久化，避免使用易变化的数组下标。
+    @Published private(set) var activeDocumentID: UUID?
+    // 最近文件由工作区统一提供给打开菜单。
+    @Published private(set) var recentDocuments: [RecentDocument] = []
+    // 会话或打开失败时提供非破坏性反馈。
+    @Published private(set) var status = "已就绪"
+
+    // 所有标签共享文档 IO 和草稿存储。
+    private let documentStore: DocumentSupportStore
+    // 会话层只保存标签身份、顺序和活动 UUID。
+    private let sessionStore: WorkspaceSessionStore
+
+    // 默认恢复上次会话；测试可注入隔离存储并关闭恢复。
+    init(
+        documentStore: DocumentSupportStore = DocumentSupportStore(),
+        sessionStore: WorkspaceSessionStore = WorkspaceSessionStore(),
+        restoresSession: Bool = true
+    ) {
+        // 保存共享文档支撑层。
+        self.documentStore = documentStore
+        // 保存会话支撑层。
+        self.sessionStore = sessionStore
+        // 先刷新最近文件，标签恢复失败也不影响菜单。
+        refreshRecentDocuments()
+        // 按调用方配置恢复会话或创建首次标签。
+        if restoresSession {
+            restoreLastSession()
+        } else {
+            appendInitialDocument()
+        }
+    }
+
+    // 返回当前活动标签；异常 UUID 时安全回退首个标签。
+    var activeDocument: EditorModel? {
+        // 优先命中持久化活动 UUID。
+        if let activeDocumentID,
+            let active = documents.first(where: { $0.id == activeDocumentID })
+        {
+            return active
+        }
+        // 会话损坏时仍可显示首个有效标签。
+        return documents.first
+    }
+
+    // 创建独立未命名标签并设为活动。
+    func newDocument() {
+        // 每次新建都生成新 UUID，不覆盖已有未命名草稿。
+        let document = EditorModel.makeUntitled(documentStore: documentStore)
+        // 建立弱工作区回调。
+        document.workspace = self
+        // 追加到标签末尾。
+        documents.append(document)
+        // 新标签立即成为活动标签。
+        activeDocumentID = document.id
+        // 原子保存新顺序和活动 UUID。
+        persistSession()
+        // 反馈新建完成。
+        status = "已新建标签"
+    }
+
+    // 激活指定文档对象，不触发草稿写入或正文复制。
+    func activate(_ document: EditorModel) {
+        // 只接受当前工作区实际持有的标签。
+        guard documents.contains(where: { $0.id == document.id }) else { return }
+        // 更新活动 UUID。
+        activeDocumentID = document.id
+        // 持久化下次启动活动标签。
+        persistSession()
+    }
+
+    // 通过稳定 UUID 激活标签，便于 SwiftUI 按钮调用。
+    func activate(id: UUID) {
+        // 找不到 UUID 时保持当前标签不变。
+        guard let document = documents.first(where: { $0.id == id }) else { return }
+        // 复用对象入口保持同一持久化逻辑。
+        activate(document)
+    }
+
+    // 按标签顺序循环切换，提供键盘快速浏览能力。
+    func activateAdjacentDocument(reverse: Bool = false) {
+        // 至少需要两个标签才有切换意义。
+        guard documents.count > 1,
+            let activeDocumentID,
+            let currentIndex = documents.firstIndex(where: { $0.id == activeDocumentID })
+        else { return }
+        // 反向时向左循环，正向时向右循环。
+        let offset = reverse ? documents.count - 1 : 1
+        // 模运算确保首尾无缝循环。
+        let nextIndex = (currentIndex + offset) % documents.count
+        // 复用统一激活逻辑并持久化活动标签。
+        activate(documents[nextIndex])
+    }
+
+    // 关闭指定标签；dirty 标签必须保存或安全落草稿。
+    func close(_ document: EditorModel) {
+        // 只处理当前数组中的精确对象。
+        guard let closingIndex = documents.firstIndex(where: { $0.id == document.id }) else { return }
+        // dirty 标签必须让用户明确选择。
+        if document.isDirty {
+            // 创建原生关闭确认框。
+            let alert = NSAlert()
+            // 标签名明确指出受影响对象。
+            alert.messageText = "关闭“\(document.filename)”？"
+            // 未命名标签没有可重新打开的文件身份，因此只能保存或取消。
+            alert.informativeText =
+                document.currentFileURL == nil
+                ? "未命名文档必须先保存到文件，关闭后才能可靠找回。"
+                : "文档尚未保存。可以保存到文件，或保留恢复草稿后关闭标签。"
+            // 第一项保存真实文件。
+            alert.addButton(withTitle: "保存")
+            // 默认安全取消。
+            alert.addButton(withTitle: "取消")
+            // 只有已命名文件能通过最近文件重新触达恢复草稿。
+            if document.currentFileURL != nil {
+                alert.addButton(withTitle: "保留草稿并关闭")
+            }
+            // 根据用户明确选择处理。
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                // 保存失败或另存为取消时保持标签打开。
+                guard document.saveDocumentIfPossible() else { return }
+            case .alertThirdButtonReturn:
+                // 草稿失败时默认阻止关闭，避免无提示丢失。
+                guard document.ensureRecoverableDraft() else {
+                    // 创建单按钮失败提示。
+                    let failureAlert = NSAlert()
+                    // 明确关闭已被阻止。
+                    failureAlert.messageText = "无法安全关闭标签"
+                    // 让用户回到编辑器另行保存。
+                    failureAlert.informativeText = "恢复草稿写入失败，标签仍保持打开。请另存为后重试。"
+                    // 唯一动作返回编辑。
+                    failureAlert.addButton(withTitle: "返回编辑")
+                    // 展示失败提示后结束关闭流程。
+                    failureAlert.runModal()
+                    return
+                }
+            default:
+                // 取消时不修改数组、活动标签或草稿。
+                return
+            }
+        } else {
+            // 干净标签清理自己的精确旧草稿。
+            try? documentStore.removeDraft(
+                for: document.currentFileURL,
+                untitledID: document.currentFileURL == nil ? document.id : nil
+            )
+        }
+
+        // 停止这个标签自己的延迟任务。
+        document.prepareForClose()
+        // 从工作区删除精确标签。
+        documents.remove(at: closingIndex)
+        // 删除活动标签时选择原位置右侧或最后一个左侧标签。
+        if activeDocumentID == document.id {
+            // 剩余为空时先清空活动 UUID。
+            activeDocumentID = documents.isEmpty ? nil : documents[min(closingIndex, documents.count - 1)].id
+        }
+        // 主窗口始终保留一个可编辑标签。
+        if documents.isEmpty {
+            // 创建空白标签但延后到统一持久化。
+            let replacement = EditorModel.makeUntitled(documentStore: documentStore)
+            // 建立工作区回调。
+            replacement.workspace = self
+            // 放入唯一标签位置。
+            documents = [replacement]
+            // 新空白标签成为活动。
+            activeDocumentID = replacement.id
+        }
+        // 原子保存关闭后的顺序。
+        persistSession()
+        // 反馈关闭完成。
+        status = "标签已关闭"
+    }
+
+    // 关闭当前活动标签。
+    func closeActiveDocument() {
+        // 没有活动标签时保持幂等。
+        guard let activeDocument else { return }
+        // 复用完整确认流程。
+        close(activeDocument)
+    }
+
+    // 使用系统面板一次选择一个或多个 Markdown 文件。
+    func openDocument() {
+        // 创建本地文件选择面板。
+        let panel = NSOpenPanel()
+        // 多选可以一次追加多个标签。
+        panel.allowsMultipleSelection = true
+        // 禁止把目录当正文读取。
+        panel.canChooseDirectories = false
+        // Markdown UTI 不可用时回退纯文本。
+        let markdownType = UTType(filenameExtension: "md") ?? .plainText
+        // 同时接受 Markdown 和普通文本。
+        panel.allowedContentTypes = [markdownType, .plainText]
+        // 取消时不改变工作区。
+        guard panel.runModal() == .OK else { return }
+        // 按面板顺序依次打开，保持可预测标签顺序。
+        openDocuments(at: panel.urls)
+    }
+
+    // 打开单个拖入、双击或最近文件 URL。
+    func openDocument(at url: URL) {
+        // 复用批量入口保证去重规则一致。
+        openDocuments(at: [url])
+    }
+
+    // 批量打开文件；重复路径只激活已有标签。
+    func openDocuments(at urls: [URL]) {
+        // 依次处理，单个失败不阻断其他文件。
+        for rawURL in urls {
+            // 只接受本地文件 URL。
+            guard rawURL.isFileURL else {
+                // 记录最近一次失败原因。
+                status = "打开失败：仅支持本地文件"
+                // 继续处理其他 URL。
+                continue
+            }
+            // 标准化路径用于跨入口去重。
+            let url = rawURL.standardizedFileURL
+            // 相同路径已打开时只激活已有标签。
+            if let existing = documents.first(where: { $0.currentFileURL == url }) {
+                // 保留原对象、正文、撤销关联和预览任务。
+                activate(existing)
+                // 最近访问顺序仍应更新。
+                try? documentStore.recordRecentDocument(url)
+                // 刷新菜单。
+                refreshRecentDocuments()
+                // 明确反馈没有产生重复标签。
+                status = "已切换到打开的标签"
+                // 继续处理下一 URL。
+                continue
+            }
+            do {
+                // 创建独立标签并处理这个路径的恢复草稿。
+                guard let document = try EditorModel.open(at: url, documentStore: documentStore) else {
+                    // 用户取消草稿选择时继续处理其他 URL。
+                    continue
+                }
+                // 建立工作区回调。
+                document.workspace = self
+                // 新文件追加到标签末尾。
+                documents.append(document)
+                // 最近成功打开的文件成为活动标签。
+                activeDocumentID = document.id
+                // 更新最近文件索引。
+                try documentStore.recordRecentDocument(url)
+                // 刷新打开菜单。
+                refreshRecentDocuments()
+                // 保存新增标签和活动 UUID。
+                persistSession()
+                // 反馈打开完成。
+                status = "文件已打开"
+            } catch {
+                // 单文件失败不破坏已有标签。
+                status = "打开失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    // 保存当前活动标签。
+    func saveDocument() {
+        // 没有活动标签时保持幂等。
+        guard let activeDocument else { return }
+        // 走标签自身编码和冲突检查。
+        activeDocument.saveDocument()
+        // 另存为成功可能改变会话 URL。
+        persistSession()
+    }
+
+    // 另存当前活动标签。
+    func saveDocumentAs() {
+        // 没有活动标签时保持幂等。
+        guard let activeDocument else { return }
+        // 打开系统保存面板。
+        activeDocument.saveDocumentAs()
+        // 成功时持久化新路径，取消时写回相同状态无副作用。
+        persistSession()
+    }
+
+    // 导出当前活动标签 HTML。
+    func exportHTML() {
+        // 没有活动标签时保持幂等。
+        activeDocument?.exportHTML()
+    }
+
+    // 复制当前活动标签公众号格式。
+    func copyWechatHTML(template: WechatExportTemplate = .simple) {
+        // 没有活动标签时保持幂等。
+        activeDocument?.copyWechatHTML(template: template)
+    }
+
+    // 应用退出前同步全部 dirty 标签草稿并保存会话。
+    @discardableResult
+    func flushDraftsAndSession() -> Bool {
+        // 默认所有标签都已安全落盘。
+        var allDraftsSaved = true
+        // 每个标签独立执行草稿保存，单个失败不跳过其他标签。
+        for document in documents where !document.flushDraftIfNeeded() {
+            // 任一失败都向调用方返回 false。
+            allDraftsSaved = false
+        }
+        // 无论草稿结果如何都尝试保留可恢复的标签顺序。
+        let sessionSaved = persistSession()
+        // 草稿和会话必须同时成功，退出流程才能确认安全。
+        return allDraftsSaved && sessionSaved
+    }
+
+    // 判断另存为路径是否会与其他打开标签冲突。
+    func canAdoptFileURL(_ rawURL: URL, for document: EditorModel) -> Bool {
+        // 非文件 URL 不允许成为本地文档身份。
+        guard rawURL.isFileURL else { return false }
+        // 规范化目标路径用于精确比较。
+        let url = rawURL.standardizedFileURL
+        // 只有另一个标签已占用同一路径时拒绝。
+        return !documents.contains { $0.id != document.id && $0.currentFileURL == url }
+    }
+
+    // 标签保存成功后刷新最近文件和会话路径。
+    func documentDidSave(_ document: EditorModel) {
+        // 只响应当前工作区实际持有的对象。
+        guard documents.contains(where: { $0.id == document.id }) else { return }
+        // 更新最近文件菜单。
+        refreshRecentDocuments()
+        // 保存另存为后的新 URL。
+        persistSession()
+    }
+
+    // 恢复上次标签顺序和活动标签。
+    private func restoreLastSession() {
+        do {
+            // 读取完整会话；首次启动返回 nil。
+            guard let session = try sessionStore.load() else {
+                // 首次启动迁移旧版草稿或展示示例。
+                appendInitialDocument()
+                return
+            }
+            // 防止损坏会话中的重复路径产生多个标签。
+            var restoredFileURLs = Set<URL>()
+            // 按持久化顺序逐个恢复有效标签。
+            for descriptor in session.documents {
+                // 网络 URL 或重复文件路径直接跳过。
+                if let fileURL = descriptor.fileURL {
+                    // 统一标准化路径。
+                    let normalizedURL = fileURL.standardizedFileURL
+                    // 非本地或已经恢复的路径无效。
+                    guard fileURL.isFileURL, !restoredFileURLs.contains(normalizedURL) else { continue }
+                    // 先登记路径，防止后续重复项。
+                    restoredFileURLs.insert(normalizedURL)
+                }
+                // 文件失效无草稿时返回 nil，不影响其他标签。
+                guard let document = EditorModel.restore(descriptor, documentStore: documentStore) else {
+                    continue
+                }
+                // 建立工作区回调。
+                document.workspace = self
+                // 保持原始标签顺序。
+                documents.append(document)
+            }
+            // 全部描述失效时回退新标签。
+            guard !documents.isEmpty else {
+                // 创建安全可编辑状态。
+                appendInitialDocument()
+                return
+            }
+            // 活动 UUID 有效时恢复，否则回退首个标签。
+            activeDocumentID =
+                documents.contains(where: { $0.id == session.activeDocumentID })
+                ? session.activeDocumentID
+                : documents.first?.id
+            // 清理失效描述并保存规范化会话。
+            persistSession()
+            // 反馈有效标签数量。
+            status = "已恢复 \(documents.count) 个标签"
+        } catch {
+            // 会话 JSON 损坏时回退新标签，不崩溃也不覆盖草稿。
+            status = "会话恢复失败，已新建标签：\(error.localizedDescription)"
+            // 创建安全可编辑状态。
+            appendInitialDocument()
+        }
+    }
+
+    // 首次启动迁移 v0.1 草稿或创建示例标签。
+    private func appendInitialDocument() {
+        // 尝试读取旧版唯一未命名草稿。
+        let legacyDraft = try? documentStore.loadDraft(for: nil)
+        // 为 v0.2 标签生成新 UUID。
+        let documentID = UUID()
+        // 旧草稿存在时保留正文和格式，否则展示示例。
+        let document = EditorModel(
+            id: documentID,
+            text: legacyDraft?.text ?? EditorModel.sample,
+            fileURL: nil,
+            encoding: legacyDraft?.encoding ?? .utf8,
+            includesByteOrderMark: legacyDraft?.includesByteOrderMark ?? false,
+            dirty: true,
+            savedText: "",
+            savedEncoding: .utf8,
+            savedIncludesByteOrderMark: false,
+            status: legacyDraft == nil ? "已就绪" : "已迁移旧版草稿",
+            documentStore: documentStore
+        )
+        // 建立工作区回调。
+        document.workspace = self
+        // 作为首个唯一标签。
+        documents = [document]
+        // 设为活动标签。
+        activeDocumentID = document.id
+        // 旧草稿先复制到新 UUID 键，成功后才删除旧键。
+        if let legacyDraft,
+            (try? documentStore.saveDraft(
+                legacyDraft.text,
+                for: nil,
+                untitledID: documentID,
+                encoding: legacyDraft.encoding,
+                includesByteOrderMark: legacyDraft.includesByteOrderMark
+            )) != nil
+        {
+            // 新草稿确认落盘后清理旧版唯一键。
+            try? documentStore.removeDraft(for: nil)
+        }
+        // 保存首次 v0.2 会话。
+        persistSession()
+    }
+
+    // 原子保存当前标签顺序和活动 UUID。
+    @discardableResult
+    private func persistSession() -> Bool {
+        do {
+            // 只保存身份和路径，正文继续由独立草稿管理。
+            let state = WorkspaceSessionState(
+                documents: documents.map {
+                    WorkspaceSessionDocument(id: $0.id, fileURL: $0.currentFileURL)
+                },
+                activeDocumentID: activeDocumentID
+            )
+            // 原子写入单个会话文件。
+            try sessionStore.save(state)
+            // 明确返回本轮会话已安全落盘。
+            return true
+        } catch {
+            // 会话失败不改变内存标签，但明确反馈。
+            status = "会话保存失败：\(error.localizedDescription)"
+            // 让退出保护阻止无提示丢失标签顺序。
+            return false
+        }
+    }
+
+    // 刷新仍存在于磁盘的最近文件。
+    private func refreshRecentDocuments() {
+        do {
+            // 失效记录不进入菜单，但不改写原索引。
+            recentDocuments = try documentStore.recentDocuments().filter {
+                FileManager.default.fileExists(atPath: $0.fileURL.path)
+            }
+        } catch {
+            // 索引损坏不影响编辑主流程。
+            recentDocuments = []
+        }
+    }
+}
+
+// 用真实文件和隔离存储验证多标签去重、草稿与会话恢复。
+@MainActor
+enum WorkspaceModelSelfCheck {
+    // 自检不显示文件面板或修改真实用户数据。
+    static func run(fileManager: FileManager = .default) throws -> String {
+        // 为本次测试创建唯一根目录。
+        let rootDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("MarkdownLiteMac-WorkspaceSelfCheck-\(UUID().uuidString)", isDirectory: true)
+        // 测试完成后只清理这个精确目录。
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+        // 先创建真实文件父目录。
+        try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        // 创建可重复打开的 Markdown 文件。
+        let fileURL = rootDirectory.appendingPathComponent("已命名.md", isDirectory: false)
+        // 通过正式 IO 保存测试正文。
+        try TextFileIO.save("# 已命名\n", to: fileURL)
+        // 文档和会话存储共享同一个隔离产品目录。
+        let documentStore = DocumentSupportStore(rootDirectory: rootDirectory, fileManager: fileManager)
+        // 会话存储使用相同隔离目录。
+        let sessionStore = WorkspaceSessionStore(rootDirectory: rootDirectory, fileManager: fileManager)
+        // 关闭恢复创建一个全新工作区。
+        let workspace = WorkspaceModel(
+            documentStore: documentStore,
+            sessionStore: sessionStore,
+            restoresSession: false
+        )
+        // 获取首个未命名标签。
+        guard let firstUntitled = workspace.activeDocument else {
+            throw DocumentSupportError.selfCheckFailed("首个未命名标签")
+        }
+        // 修改首个标签以触发独立草稿。
+        firstUntitled.text = "未命名一"
+        // 新建第二个未命名标签。
+        workspace.newDocument()
+        // 获取第二个活动标签。
+        guard let secondUntitled = workspace.activeDocument else {
+            throw DocumentSupportError.selfCheckFailed("第二个未命名标签")
+        }
+        // 修改第二个标签以触发另一份草稿。
+        secondUntitled.text = "未命名二"
+        // 第一次打开真实文件应追加标签。
+        workspace.openDocument(at: fileURL)
+        // 记录已命名标签 UUID。
+        guard let namedID = workspace.activeDocument?.id, workspace.documents.count == 3 else {
+            throw DocumentSupportError.selfCheckFailed("追加已命名标签")
+        }
+        // 第二次打开同一路径必须只激活已有标签。
+        workspace.openDocument(at: fileURL)
+        // 数量和 UUID 都必须保持不变。
+        guard workspace.documents.count == 3, workspace.activeDocument?.id == namedID else {
+            throw DocumentSupportError.selfCheckFailed("同路径标签去重")
+        }
+        // 将首个标签设为活动以验证活动 UUID 恢复。
+        workspace.activate(firstUntitled)
+        // 应用退出路径必须保存两个独立未命名草稿。
+        guard workspace.flushDraftsAndSession() else {
+            throw DocumentSupportError.selfCheckFailed("全部标签草稿保存")
+        }
+        // 保存预期标签顺序。
+        let expectedOrder = workspace.documents.map(\.id)
+        // 用同一隔离存储模拟重新启动。
+        let restoredWorkspace = WorkspaceModel(
+            documentStore: documentStore,
+            sessionStore: sessionStore,
+            restoresSession: true
+        )
+        // 顺序、活动标签和正文都必须跨启动保留。
+        guard restoredWorkspace.documents.map(\.id) == expectedOrder,
+            restoredWorkspace.activeDocument?.id == firstUntitled.id,
+            restoredWorkspace.documents.first(where: { $0.id == firstUntitled.id })?.text == "未命名一",
+            restoredWorkspace.documents.first(where: { $0.id == secondUntitled.id })?.text == "未命名二"
+        else {
+            throw DocumentSupportError.selfCheckFailed("多标签会话恢复")
+        }
+        // 构造仅含失效文件的会话，验证恢复不会崩溃。
+        let missingID = UUID()
+        // 保存一个不存在且没有草稿的路径。
+        try sessionStore.save(
+            WorkspaceSessionState(
+                documents: [
+                    WorkspaceSessionDocument(
+                        id: missingID,
+                        fileURL: rootDirectory.appendingPathComponent("已删除.md")
+                    )
+                ],
+                activeDocumentID: missingID
+            )
+        )
+        // 恢复会跳过失效描述并创建安全新标签。
+        let fallbackWorkspace = WorkspaceModel(
+            documentStore: documentStore,
+            sessionStore: sessionStore,
+            restoresSession: true
+        )
+        // 安全回退必须留下一个可编辑标签。
+        guard fallbackWorkspace.documents.count == 1,
+            fallbackWorkspace.activeDocument != nil,
+            fallbackWorkspace.activeDocument?.id != missingID
+        else {
+            throw DocumentSupportError.selfCheckFailed("失效文件安全回退")
+        }
+        // 用普通文件占据会话根目录，稳定制造会话写入失败。
+        let blockedSessionRoot = rootDirectory.appendingPathComponent("blocked-session-root")
+        // 写入普通文件后，SessionStore 无法在同一路径创建目录。
+        try Data("blocked".utf8).write(to: blockedSessionRoot, options: .atomic)
+        // 草稿使用独立有效目录，保证失败只来自会话落盘。
+        let validDraftRoot = rootDirectory.appendingPathComponent("valid-draft-root", isDirectory: true)
+        // 创建隔离工作区以验证退出保护返回失败。
+        let blockedWorkspace = WorkspaceModel(
+            documentStore: DocumentSupportStore(rootDirectory: validDraftRoot, fileManager: fileManager),
+            sessionStore: WorkspaceSessionStore(rootDirectory: blockedSessionRoot, fileManager: fileManager),
+            restoresSession: false
+        )
+        // 草稿成功但会话失败时，退出流程仍必须被阻止。
+        guard !blockedWorkspace.flushDraftsAndSession() else {
+            throw DocumentSupportError.selfCheckFailed("会话失败阻止退出")
+        }
+        // 返回可复核的综合通过标记。
+        return "WorkspaceModelSelfCheck：多标签去重、独立草稿、顺序、活动标签、失效文件与退出保护通过"
+    }
+}
