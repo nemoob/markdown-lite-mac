@@ -117,20 +117,21 @@ final class WorkspaceModel: ObservableObject {
         documents.append(document)
         // 新标签立即成为活动标签。
         activeDocumentID = document.id
-        // 原子保存新顺序和活动 UUID。
-        persistSession()
+        // 只有新顺序安全落盘后才能用成功文案覆盖会话错误。
+        guard persistSession() else { return }
         // 反馈新建完成。
         status = "已新建标签"
     }
 
     // 激活指定文档对象，不触发草稿写入或正文复制。
-    func activate(_ document: EditorModel) {
+    @discardableResult
+    func activate(_ document: EditorModel) -> Bool {
         // 只接受当前工作区实际持有的标签。
-        guard documents.contains(where: { $0.id == document.id }) else { return }
+        guard documents.contains(where: { $0.id == document.id }) else { return false }
         // 更新活动 UUID。
         activeDocumentID = document.id
         // 持久化下次启动活动标签。
-        persistSession()
+        return persistSession()
     }
 
     // 通过稳定 UUID 激活标签，便于 SwiftUI 按钮调用。
@@ -248,8 +249,8 @@ final class WorkspaceModel: ObservableObject {
             // 新空白标签成为活动。
             activeDocumentID = replacement.id
         }
-        // 原子保存关闭后的顺序。
-        persistSession()
+        // 只有关闭后的顺序安全落盘后才能展示成功文案。
+        guard persistSession() else { return }
         // 反馈关闭完成。
         status = "标签已关闭"
     }
@@ -302,7 +303,10 @@ final class WorkspaceModel: ObservableObject {
             // 相同路径已打开时只激活已有标签。
             if let existing = documents.first(where: { $0.currentFileURL == url }) {
                 // 保留原对象、正文、撤销关联和预览任务。
-                activate(existing)
+                guard activate(existing) else {
+                    // 会话失败状态由 activate 内部 persistSession 保留。
+                    continue
+                }
                 // 最近访问顺序仍应更新。
                 try? recordRecentDocument(url)
                 // 刷新菜单。
@@ -346,8 +350,8 @@ final class WorkspaceModel: ObservableObject {
             }
             // 无论索引写入是否成功都重新读取菜单状态。
             refreshRecentDocuments()
-            // 无论索引写入是否成功都保存新增标签和活动 UUID。
-            persistSession()
+            // 只有新增标签身份安全落盘后才能用打开成功文案覆盖会话错误。
+            guard persistSession() else { continue }
             // 明确区分完整成功与最近文件辅助索引失败。
             status = recentDocumentWasUpdated ? "文件已打开" : "文件已打开，最近文件更新失败"
         }
@@ -424,12 +428,14 @@ final class WorkspaceModel: ObservableObject {
     // 恢复上次标签顺序和活动标签。
     private func restoreLastSession() {
         do {
-            // 读取完整会话；首次启动返回 nil。
-            guard let session = try sessionStore.load() else {
+            // 读取完整会话及实际代次；首次启动返回 nil。
+            guard let sessionLoad = try sessionStore.loadWithRecoverySource() else {
                 // 首次启动迁移旧版草稿或展示示例。
                 appendInitialDocument()
                 return
             }
+            // 后续标签恢复只消费已经完整解码的会话状态。
+            let session = sessionLoad.state
             // 防止损坏会话中的重复路径产生多个标签。
             var restoredFileURLs = Set<URL>()
             // 按持久化顺序逐个恢复有效标签。
@@ -456,6 +462,11 @@ final class WorkspaceModel: ObservableObject {
             guard !documents.isEmpty else {
                 // 创建安全可编辑状态。
                 appendInitialDocument()
+                // 上一代没有任何有效描述时也要说明本次确实发生了回退。
+                if sessionLoad.recoveredFromPrevious, !status.contains("失败") {
+                    // 当前新标签已经安全持久化，可以展示上一代失效边界。
+                    status = "上一代会话没有可恢复标签，已新建标签"
+                }
                 return
             }
             // 活动 UUID 有效时恢复，否则回退首个标签。
@@ -463,22 +474,27 @@ final class WorkspaceModel: ObservableObject {
                 documents.contains(where: { $0.id == session.activeDocumentID })
                 ? session.activeDocumentID
                 : documents.first?.id
-            // 清理失效描述并保存规范化会话。
-            persistSession()
-            // 反馈有效标签数量。
-            status = "已恢复 \(documents.count) 个标签"
+            // 清理失效描述并修复当前代会话；失败状态由 persistSession 保留。
+            guard persistSession() else { return }
+            // 上一代回退必须在界面明确可见，避免用户误以为当前代仍然完好。
+            status =
+                sessionLoad.recoveredFromPrevious
+                ? "已从上一代会话恢复 \(documents.count) 个标签"
+                : "已恢复 \(documents.count) 个标签"
         } catch {
             // 会话 JSON 损坏时回退新标签，不崩溃也不覆盖草稿。
             status = "会话恢复失败，已新建标签：\(error.localizedDescription)"
-            // 创建安全可编辑状态。
-            appendInitialDocument()
+            // 创建安全可编辑状态，但不迁移草稿或保存空会话覆盖损坏证据。
+            appendInitialDocument(allowsPersistence: false)
         }
     }
 
     // 首次启动迁移 v0.1 草稿或创建示例标签。
-    private func appendInitialDocument() {
-        // 尝试读取旧版唯一未命名草稿。
-        let legacyDraft = try? documentStore.loadDraft(for: nil)
+    private func appendInitialDocument(allowsPersistence: Bool = true) {
+        // 会话损坏路径不得读取后再迁移任何旧草稿，避免制造无法持久化的新映射。
+        let legacyLoad = allowsPersistence ? try? documentStore.loadDraftWithRecoverySource(for: nil) : nil
+        // 后续初始化只使用已经通过身份校验的旧草稿。
+        let legacyDraft = legacyLoad?.draft
         // 为 v0.2 标签生成新 UUID。
         let documentID = UUID()
         // 旧草稿存在时保留正文和格式，否则展示示例。
@@ -492,7 +508,11 @@ final class WorkspaceModel: ObservableObject {
             savedText: "",
             savedEncoding: .utf8,
             savedIncludesByteOrderMark: false,
-            status: legacyDraft == nil ? "已就绪" : "已迁移旧版草稿",
+            status: legacyDraft == nil
+                ? "已就绪"
+                : legacyLoad?.recoveredFromPrevious == true
+                    ? "已从上一代恢复并迁移旧版草稿"
+                    : "已迁移旧版草稿",
             documentStore: documentStore
         )
         // 建立工作区回调。
@@ -502,7 +522,8 @@ final class WorkspaceModel: ObservableObject {
         // 设为活动标签。
         activeDocumentID = document.id
         // 旧草稿先复制到新 UUID 键，成功后才删除旧键。
-        if let legacyDraft,
+        if allowsPersistence,
+            let legacyDraft,
             (try? documentStore.saveDraft(
                 legacyDraft.text,
                 for: nil,
@@ -514,6 +535,8 @@ final class WorkspaceModel: ObservableObject {
             // 新草稿确认落盘后清理旧版唯一键。
             try? documentStore.removeDraft(for: nil)
         }
+        // 会话损坏时停止在纯内存安全状态，不能覆盖唯一恢复证据。
+        guard allowsPersistence else { return }
         // 保存首次 v0.2 会话。
         persistSession()
     }

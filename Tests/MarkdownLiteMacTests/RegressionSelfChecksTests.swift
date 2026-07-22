@@ -24,6 +24,54 @@ struct RegressionSelfChecksTests {
         #expect(result.contains("恢复通过"))
     }
 
+    // 双代恢复的标准测试只校验固定样本和完整功能，发布配置另行执行墙钟阈值。
+    @Test("双代恢复基准样本")
+    func testRecoverySupportSelfCheckSamples() throws {
+        // 复用正式隔离自检但关闭 Debug 环境的耗时断言。
+        let report = try RecoverySupportSelfCheck.run(enforcePerformanceTargets: false)
+        // 草稿样本必须真实覆盖至少 1MB UTF-8 正文。
+        #expect(report.draftBytes >= 1_000_000)
+        // 三条完整生产路径都必须产生非负可报告耗时。
+        #expect(report.draftSaveMedianMilliseconds >= 0)
+        // 草稿损坏回退也必须完成五次中位数测量。
+        #expect(report.draftFallbackMedianMilliseconds >= 0)
+        // 100 标签会话回退必须输出独立耗时。
+        #expect(report.sessionFallbackMedianMilliseconds >= 0)
+    }
+
+    // 状态栏必须优先展示真实失败，同时保留成功会话回退与当前文档结果。
+    @Test("恢复状态显示优先级")
+    func testRecoveryStatusPresentationPriority() {
+        // 工作区保存失败会影响全部标签，优先于文档普通状态。
+        #expect(
+            WorkspaceStatusPresentation.visibleStatus(
+                workspaceStatus: "会话保存失败：磁盘不可写",
+                documentStatus: "正在编辑…"
+            ) == "会话保存失败：磁盘不可写"
+        )
+        // 文档草稿失败比成功型上一代会话提示更紧急。
+        #expect(
+            WorkspaceStatusPresentation.visibleStatus(
+                workspaceStatus: "已从上一代会话恢复 1 个标签",
+                documentStatus: "草稿恢复失败，损坏数据已保留"
+            ) == "草稿恢复失败，损坏数据已保留"
+        )
+        // 没有失败时同时保留会话来源和当前文档恢复结果。
+        #expect(
+            WorkspaceStatusPresentation.visibleStatus(
+                workspaceStatus: "已从上一代会话恢复 1 个标签",
+                documentStatus: "已从上一代草稿恢复"
+            ) == "已从上一代会话恢复 1 个标签；已从上一代草稿恢复"
+        )
+        // 普通会话状态不抢占当前标签反馈。
+        #expect(
+            WorkspaceStatusPresentation.visibleStatus(
+                workspaceStatus: "已就绪",
+                documentStatus: "已自动保存草稿"
+            ) == "已自动保存草稿"
+        )
+    }
+
     // 多标签、独立草稿和失效文件回退必须通过。
     @Test("多标签工作区")
     @MainActor

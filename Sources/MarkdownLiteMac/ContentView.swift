@@ -2,6 +2,23 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+// 统一选择状态栏可见反馈，避免会话回退提示遮住更紧急的文档风险。
+enum WorkspaceStatusPresentation {
+    // 按数据安全优先级组合工作区和当前文档状态。
+    static func visibleStatus(workspaceStatus: String, documentStatus: String) -> String {
+        // 会话持久化或恢复失败会影响全部标签，始终最高优先。
+        guard !workspaceStatus.contains("失败") else { return workspaceStatus }
+        // 当前文档恢复、保存失败或冲突阻止需要立即覆盖成功型会话提示。
+        guard !documentStatus.contains("失败"), !documentStatus.contains("阻止") else {
+            return documentStatus
+        }
+        // 成功从上一代会话恢复时保留全局来源，同时不隐藏当前文档状态。
+        guard workspaceStatus.contains("上一代会话") else { return documentStatus }
+        // 用一个状态栏同时说明会话来源和当前标签结果。
+        return "\(workspaceStatus)；\(documentStatus)"
+    }
+}
+
 // 保存编辑栏格式菜单的一项可测试描述和原生动作路由。
 struct EditorFormattingMenuEntry: Identifiable, Equatable, Sendable {
     // 稳定标识供 SwiftUI 菜单复用对应项。
@@ -178,9 +195,13 @@ private struct WorkspaceEditorView: View {
         WechatExportTemplate(rawValue: templateRawValue) ?? .simple
     }
 
-    // 打开失败优先展示工作区反馈，其他时间展示当前标签状态。
+    // 工作区失败和上一代会话恢复优先展示，其他时间显示当前标签状态。
     private var visibleStatus: String {
-        workspace.status.contains("失败") ? workspace.status : document.status
+        // 复用可测试的安全优先级，确保文档失败不会被成功型会话提示遮住。
+        WorkspaceStatusPresentation.visibleStatus(
+            workspaceStatus: workspace.status,
+            documentStatus: document.status
+        )
     }
 
     // 组合日常写作所需的所有区域。

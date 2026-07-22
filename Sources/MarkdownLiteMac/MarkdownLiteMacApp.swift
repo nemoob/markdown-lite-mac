@@ -13,6 +13,8 @@ private func runSelfCheck() {
         let listContinuationReport = MarkdownListContinuationSelfCheck.run()
         // 会话层验证标签顺序和活动标签可跨启动恢复。
         let sessionReport = try SessionSupportSelfCheck.run()
+        // 双代恢复层用 1MB 草稿和 100 标签会话执行功能与性能门禁。
+        let recoveryReport = try RecoverySupportSelfCheck.run()
         // 图片层验证相对路径、重名、类型和目录安全。
         let assetCheckCount = AssetSupportSelfCheck.run(printResults: false)
         // 工作区层验证真实多标签去重、草稿和失效文件恢复。
@@ -25,6 +27,14 @@ private func runSelfCheck() {
         print(documentReport)
         // 输出会话恢复通过项。
         print(sessionReport)
+        // 输出双代恢复三条发布性能证据。
+        print(
+            "双代恢复性能通过：1MB 保存中位数 "
+                + "\(String(format: "%.2f", recoveryReport.draftSaveMedianMilliseconds))ms，"
+                + "1MB 回退中位数 \(String(format: "%.2f", recoveryReport.draftFallbackMedianMilliseconds))ms，"
+                + "100 标签会话回退中位数 "
+                + "\(String(format: "%.2f", recoveryReport.sessionFallbackMedianMilliseconds))ms"
+        )
         // 输出图片资源层通过项。
         print("AssetSupportSelfCheck 通过 \(assetCheckCount) 项")
         // 输出多标签工作区综合通过项。

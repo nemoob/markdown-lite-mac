@@ -91,6 +91,8 @@ final class EditorModel: ObservableObject, Identifiable {
     private var draftWriteTask: Task<Void, Never>?
     // HTML 图片读取、编码和原子写入使用独立后台任务，避免阻塞编辑输入。
     private var exportTask: Task<Void, Never>?
+    // 双代草稿都不可用时保持独立保护，普通撤销不能把损坏证据当作旧草稿清理。
+    private var hasUnresolvedDraftRecoveryFailure: Bool
 
     // 保留旧调用方式，实际应用由 WorkspaceModel 注入共享存储。
     convenience init() {
@@ -133,6 +135,7 @@ final class EditorModel: ObservableObject, Identifiable {
         documentStore: DocumentSupportStore,
         externalFileSnapshot: ExternalFileSnapshot? = nil,
         initialExternalChangeState: ExternalDocumentChangeState? = nil,
+        unresolvedDraftRecoveryFailure: Bool = false,
         recordRecentDocument: ((URL) throws -> Void)? = nil
     ) {
         // 先保存稳定标签身份。
@@ -145,6 +148,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 // 默认路径保持既有存储实现和排序语义。
                 try documentStore.recordRecentDocument(fileURL)
             }
+        // 恢复失败保护独立于普通 dirty 快照，直到正文安全落盘或用户明确丢弃。
+        hasUnresolvedDraftRecoveryFailure = unresolvedDraftRecoveryFailure
         // 初始化正文，不触发 didSet。
         self.text = text
         // 先用局部值规范化真实文件路径，避免初始化期间读取 self。
@@ -281,8 +286,29 @@ final class EditorModel: ObservableObject, Identifiable {
     ) -> EditorModel? {
         // 未命名标签按 UUID 精确恢复自己的草稿。
         guard let fileURL = descriptor.fileURL else {
-            // 草稿损坏时回退空标签，不能让整个会话崩溃。
-            let draft = try? documentStore.loadDraft(for: nil, untitledID: descriptor.id)
+            // 预留带来源的草稿结果，便于向用户说明上一代回退。
+            var draftLoad: DraftLoadResult?
+            // 单独记录双代恢复失败，避免把空标签误标成可安全关闭。
+            var draftRecoveryFailed = false
+            do {
+                // 未命名草稿必须继续按标签 UUID 严格隔离。
+                draftLoad = try documentStore.loadDraftWithRecoverySource(
+                    for: nil,
+                    untitledID: descriptor.id
+                )
+            } catch {
+                // 存储层保留损坏证据，模型只进入受保护的空白编辑状态。
+                draftRecoveryFailed = true
+            }
+            // 后续恢复逻辑只消费已经通过身份校验的草稿。
+            let draft = draftLoad?.draft
+            // 恢复状态明确区分正常、上一代回退和双代失败。
+            let restoredStatus =
+                draftRecoveryFailed
+                ? "草稿恢复失败，损坏数据已保留"
+                : draftLoad?.recoveredFromPrevious == true
+                    ? "已从上一代草稿恢复"
+                    : draft == nil ? "已恢复空白标签" : "已恢复草稿"
             // 草稿存在即表示尚未写入真实文件。
             return EditorModel(
                 id: descriptor.id,
@@ -290,12 +316,13 @@ final class EditorModel: ObservableObject, Identifiable {
                 fileURL: nil,
                 encoding: draft?.encoding ?? .utf8,
                 includesByteOrderMark: draft?.includesByteOrderMark ?? false,
-                dirty: draft != nil,
+                dirty: draft != nil || draftRecoveryFailed,
                 savedText: "",
                 savedEncoding: .utf8,
                 savedIncludesByteOrderMark: false,
-                status: draft == nil ? "已恢复空白标签" : "已恢复草稿",
-                documentStore: documentStore
+                status: restoredStatus,
+                documentStore: documentStore,
+                unresolvedDraftRecoveryFailure: draftRecoveryFailed
             )
         }
 
@@ -303,10 +330,21 @@ final class EditorModel: ObservableObject, Identifiable {
         let diskRead = try? TextFileIO.readWithSnapshot(from: fileURL)
         // 后续恢复逻辑只消费无损解码正文。
         let diskContent = diskRead?.content
-        // 已命名草稿仍按规范化路径定位。
-        let draft = try? documentStore.loadDraft(for: fileURL)
+        // 预留带来源的已命名草稿结果，便于反馈上一代回退。
+        var draftLoad: DraftLoadResult?
+        // 双代都不可用时仍保留磁盘正文和损坏草稿证据。
+        var draftRecoveryFailed = false
+        do {
+            // 已命名草稿继续按规范化路径和内嵌身份双重校验。
+            draftLoad = try documentStore.loadDraftWithRecoverySource(for: fileURL)
+        } catch {
+            // 恢复失败不让整个会话崩溃，也不能把标签当成干净状态自动清理草稿。
+            draftRecoveryFailed = true
+        }
+        // 后续恢复逻辑只使用已经验证的草稿。
+        let draft = draftLoad?.draft
         // 文件失效且没有草稿时跳过这个标签。
-        guard diskContent != nil || draft != nil else { return nil }
+        guard diskContent != nil || draft != nil || draftRecoveryFailed else { return nil }
         // 草稿与磁盘不同时优先恢复草稿，避免会话恢复阶段弹出多次警告。
         let shouldRestoreDraft = draft != nil && draft?.text != diskContent?.text
         // 选择安全的当前正文。
@@ -346,11 +384,25 @@ final class EditorModel: ObservableObject, Identifiable {
             ?? (diskRead == nil ? .deleted : .unchanged)
         // 冲突恢复需要直接提示外部版本风险，不能只显示普通草稿恢复。
         let restoredStatus =
-            diskContent == nil
-            ? "原文件失效，已恢复草稿"
-            : shouldRestoreDraft && restoredExternalState == .modified
-                ? "已恢复草稿，检测到磁盘版本已在外部修改"
-                : shouldRestoreDraft ? "已恢复草稿" : "已恢复文件"
+            draftRecoveryFailed
+            ? diskContent == nil
+                ? "原文件失效且草稿恢复失败，损坏数据已保留"
+                : "草稿恢复失败，已打开磁盘文件并保留损坏数据"
+            : diskContent == nil
+                ? draftLoad?.recoveredFromPrevious == true
+                    ? "原文件失效，已从上一代草稿恢复"
+                    : "原文件失效，已恢复草稿"
+                : shouldRestoreDraft && restoredExternalState == .modified
+                    ? draftLoad?.recoveredFromPrevious == true
+                        ? "已从上一代草稿恢复，检测到磁盘版本已在外部修改"
+                        : "已恢复草稿，检测到磁盘版本已在外部修改"
+                    : shouldRestoreDraft
+                        ? draftLoad?.recoveredFromPrevious == true
+                            ? "已从上一代草稿恢复"
+                            : "已恢复草稿"
+                        : draftLoad?.recoveredFromPrevious == true
+                            ? "已从上一代草稿核对，磁盘文件未变化"
+                            : "已恢复文件"
         // 返回完整独立标签模型。
         return EditorModel(
             id: descriptor.id,
@@ -358,14 +410,15 @@ final class EditorModel: ObservableObject, Identifiable {
             fileURL: fileURL,
             encoding: restoredEncoding,
             includesByteOrderMark: restoredBOM,
-            dirty: shouldRestoreDraft || diskContent == nil,
+            dirty: shouldRestoreDraft || diskContent == nil || draftRecoveryFailed,
             savedText: savedText,
             savedEncoding: diskContent?.encoding ?? restoredEncoding,
             savedIncludesByteOrderMark: diskContent?.includesByteOrderMark ?? restoredBOM,
             status: restoredStatus,
             documentStore: documentStore,
             externalFileSnapshot: restoredSnapshot,
-            initialExternalChangeState: restoredExternalState
+            initialExternalChangeState: restoredExternalState,
+            unresolvedDraftRecoveryFailure: draftRecoveryFailed
         )
     }
 
@@ -379,8 +432,10 @@ final class EditorModel: ObservableObject, Identifiable {
         let diskRead = try TextFileIO.readWithSnapshot(from: fileURL)
         // 后续草稿选择逻辑消费同一份正文。
         let diskContent = diskRead.content
-        // 再读取这个路径自己的恢复草稿。
-        let draft = try documentStore.loadDraft(for: fileURL)
+        // 再读取这个路径自己的恢复草稿并保留实际采用的代次。
+        let draftLoad = try documentStore.loadDraftWithRecoverySource(for: fileURL)
+        // 后续选择逻辑只消费已经通过身份校验的草稿。
+        let draft = draftLoad?.draft
         // 默认使用磁盘内容。
         var restoredDraft: DocumentDraft?
         // 内容不同必须让用户明确选择，不能静默丢弃任一版本。
@@ -389,8 +444,11 @@ final class EditorModel: ObservableObject, Identifiable {
             let alert = NSAlert()
             // 明确问题标题。
             alert.messageText = "发现未合并的恢复草稿"
-            // 明确恢复语义。
-            alert.informativeText = "草稿与磁盘文件内容不同。恢复草稿不会立即覆盖磁盘文件。"
+            // 上一代回退需要明确说明当前代不可用，同时保持不覆盖磁盘的既有语义。
+            alert.informativeText =
+                draftLoad?.recoveredFromPrevious == true
+                ? "当前草稿不可用，已找到同一文档的上一代草稿。恢复不会立即覆盖磁盘文件。"
+                : "草稿与磁盘文件内容不同。恢复草稿不会立即覆盖磁盘文件。"
             // 第一项保留草稿。
             alert.addButton(withTitle: "恢复草稿")
             // 第二项明确丢弃草稿。
@@ -444,8 +502,12 @@ final class EditorModel: ObservableObject, Identifiable {
             restoredDraft == nil
             ? "文件已打开"
             : restoredExternalState == .modified
-                ? "已恢复草稿，检测到磁盘版本已在外部修改"
-                : "已恢复草稿，磁盘版本尚未覆盖"
+                ? draftLoad?.recoveredFromPrevious == true
+                    ? "已从上一代草稿恢复，检测到磁盘版本已在外部修改"
+                    : "已恢复草稿，检测到磁盘版本已在外部修改"
+                : draftLoad?.recoveredFromPrevious == true
+                    ? "已从上一代草稿恢复，磁盘版本尚未覆盖"
+                    : "已恢复草稿，磁盘版本尚未覆盖"
         // 创建独立文件标签。
         return EditorModel(
             id: id,
@@ -496,7 +558,18 @@ final class EditorModel: ObservableObject, Identifiable {
     // 原生编辑器只在撤销或重做完成后调用，用完整保存快照精确修正 dirty 状态。
     func reconcileDirtyAfterUndoRedo() {
         // 普通输入仍走常量时间 markChanged；这里仅为撤销栈回到保存内容的低频路径做全文核对。
-        isDirty = saveState.reconcile(text: text, fileURL: currentFileURL)
+        let reconciledDirty = saveState.reconcile(text: text, fileURL: currentFileURL)
+        // 双代失败未解决前，即使正文撤销回磁盘快照也不能自动删除损坏证据。
+        guard !hasUnresolvedDraftRecoveryFailure else {
+            // 保持 dirty 让关闭和退出流程继续要求明确保存或丢弃。
+            isDirty = true
+            // 撤销后的状态栏重新展示仍未解决的数据恢复风险。
+            status = "草稿恢复失败，损坏数据仍保留"
+            // 不能进入普通干净路径的计时器取消和草稿删除。
+            return
+        }
+        // 没有独立恢复风险时沿用保存快照精确修正 dirty。
+        isDirty = reconciledDirty
         // 仍与保存快照不同时保留当前草稿节流和恢复能力。
         guard !isDirty else { return }
         // 回到保存快照后停止尚未触发的草稿计时器。
@@ -552,6 +625,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 )
                 // 新输入取消后不允许旧任务覆盖状态栏。
                 guard !Task.isCancelled else { return }
+                // 成功写入新的有效 current 后，双代失败保护已经得到解决。
+                self?.hasUnresolvedDraftRecoveryFailure = false
                 // 模型仍存活时反馈草稿已经落盘。
                 self?.status = "已自动保存草稿"
             } catch {
@@ -633,6 +708,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 includesByteOrderMark: includesByteOrderMark,
                 baselineContentDigest: externalFileSnapshot?.contentDigest
             )
+            // 同步写入成功证明当前正文已有有效恢复入口。
+            hasUnresolvedDraftRecoveryFailure = false
             // 明确反馈草稿已经安全落盘。
             status = "已自动保存草稿"
             // 调用方可以安全切换或关闭。
@@ -866,6 +943,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 encoding: diskRead.content.encoding,
                 includesByteOrderMark: diskRead.content.includesByteOrderMark
             )
+            // 用户明确采用磁盘版本后，旧草稿恢复失败不再阻止干净状态。
+            hasUnresolvedDraftRecoveryFailure = false
             // 发布干净状态。
             isDirty = false
             // 采用与本次正文严格匹配的磁盘快照。
@@ -1024,6 +1103,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 encoding: currentEncoding,
                 includesByteOrderMark: includesByteOrderMark
             )
+            // 正文成功写入真实文件后，旧恢复失败已经由明确保存解决。
+            hasUnresolvedDraftRecoveryFailure = false
             // 磁盘已经追平当前正文。
             isDirty = false
             // 保存实际写入字节对应的指纹供下一次冲突检查使用。
