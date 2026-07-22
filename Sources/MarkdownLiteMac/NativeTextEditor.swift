@@ -297,6 +297,8 @@ struct NativeTextEditor: NSViewRepresentable {
     var onImportImageFile: ((URL) -> String?)?
     // 剪贴板位图落盘由上层当前文档处理。
     var onImportImageData: ((Data, String) -> String?)?
+    // 原生撤销或重做完成后通知模型按保存快照校准 dirty 状态。
+    var onUndoRedoTextChange: (() -> Void)?
     // 光标行变化时通知上层更新当前大纲章节。
     var onSelectionLineChanged: ((Int) -> Void)?
 
@@ -473,10 +475,23 @@ struct NativeTextEditor: NSViewRepresentable {
         private func applyModelText(_ incomingText: String, to textView: NSTextView) {
             // 保存旧选区用于尽可能恢复光标。
             let selection = textView.selectedRange()
+            // 整体换文前结束连续输入合并，避免旧输入组跨越新的磁盘正文。
+            textView.breakUndoCoalescing()
+            // NSTextView 的输入撤销动作实际绑定到当前 textStorage，而非文本视图本身。
+            let textStorage = textView.textStorage
+            // 多标签共享窗口撤销管理器，因此只保留引用供精确清理当前存储动作。
+            let undoManager = textView.undoManager
             // 抑制程序化 setter 可能产生的 delegate 回声。
             isApplyingModelText = true
             // 仅外部模型真正变化时才触发整文 setter。
             textView.string = incomingText
+            // 整体替换后旧范围已经失效，只移除当前标签 textStorage 对应的撤销动作。
+            if let textStorage {
+                // 目标级清理不会删除同一窗口中其他标签注册的撤销历史。
+                undoManager?.removeAllActions(withTarget: textStorage)
+            }
+            // 清理后再次断开合并，让后续用户输入从新的撤销组开始。
+            textView.breakUndoCoalescing()
             // setter 已同步完成，可以恢复正常用户输入通知。
             isApplyingModelText = false
             // 将旧位置限制在新文本 UTF-16 长度内。
@@ -612,6 +627,8 @@ struct NativeTextEditor: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else { return }
             // 程序化整体换文不能再反向写回模型。
             guard !isApplyingModelText else { return }
+            // 在撤销管理器仍处于执行阶段时捕获本次变化来源。
+            let isUndoRedoChange = textView.undoManager?.isUndoing == true || textView.undoManager?.isRedoing == true
             // 新用户输入使尚未应用的旧外部模型结果失效。
             modelSyncGeneration &+= 1
             // 取消等待严格核对或输入法结束的旧同步任务。
@@ -628,6 +645,11 @@ struct NativeTextEditor: NSViewRepresentable {
             hasPendingNativeEcho = true
             // 回写 SwiftUI 状态。
             parent.text = changedText
+            // 正文回写完成后再校准 dirty，确保模型比较的是撤销或重做后的最新内容。
+            if isUndoRedoChange {
+                // 普通输入不触发全文保存快照比较，继续保持输入热路径的常量时间标记。
+                parent.onUndoRedoTextChange?()
+            }
             // 只刷新光标附近和可见区，大文档自动限制扫描体量。
             scheduleHighlight(
                 for: textView,

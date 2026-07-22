@@ -82,6 +82,8 @@ enum EnhancedMarkdownParser {
 
     // 将 Markdown 拆成可按块懒加载渲染的数据。
     static func parse(_ markdown: String) -> [EnhancedPreviewBlock] {
+        // 已过期的 detached 任务在任何整文扫描前直接退出。
+        guard !Task.isCancelled else { return [] }
         // 仅在必要时统一 Windows 和旧式 Mac 换行，常见输入不产生副本。
         let normalized: String
         // 含回车的文档需要转换为单一换行格式。
@@ -96,8 +98,12 @@ enum EnhancedMarkdownParser {
             normalized = markdown
         }
 
+        // 换行规范化期间收到取消时不继续拆分和解析全文。
+        guard !Task.isCancelled else { return [] }
         // 使用 Substring 保留对原文存储的共享，识别阶段避免逐行复制。
         let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false)
+        // 整文拆分完成后再次响应取消，避免继续占用旧预览的 CPU。
+        guard !Task.isCancelled else { return [] }
         // 预留常见块数量，降低长文档结果数组扩容次数。
         var blocks: [EnhancedPreviewBlock] = []
         // 块数量通常小于行数，因此先按一半行数预留且不设过大的固定值。
@@ -107,6 +113,8 @@ enum EnhancedMarkdownParser {
 
         // 每轮至少消费一行，整体识别复杂度保持线性。
         while index < lines.count {
+            // 新输入取消旧解析时立即丢弃不完整块并停止主扫描。
+            guard !Task.isCancelled else { return [] }
             // 读取当前行的共享切片。
             let line = lines[index]
             // 空白行只负责结束前一个块。
@@ -126,12 +134,14 @@ enum EnhancedMarkdownParser {
                 // 起始围栏自身不属于代码正文。
                 index += 1
                 // 扫描到匹配闭合围栏或文档结尾。
-                while index < lines.count, !isClosingFence(lines[index], opening: fence) {
+                while !Task.isCancelled, index < lines.count, !isClosingFence(lines[index], opening: fence) {
                     // 保留每行原始空白供代码预览使用。
                     codeLines.append(lines[index])
                     // 移动到下一行代码。
                     index += 1
                 }
+                // 取消时不再拼接可能很大的代码正文。
+                guard !Task.isCancelled else { return [] }
                 // 存在闭合围栏时跳过闭合行。
                 if index < lines.count {
                     // 闭合围栏不生成额外块。
@@ -178,7 +188,7 @@ enum EnhancedMarkdownParser {
                 // 收集后续非空表格数据行。
                 var rows: [[String]] = []
                 // 连续含管道符的行属于当前表格。
-                while index < lines.count, !isBlank(lines[index]), lines[index].contains("|") {
+                while !Task.isCancelled, index < lines.count, !isBlank(lines[index]), lines[index].contains("|") {
                     // 按表头列数补齐或裁剪当前数据行。
                     guard let cells = tableCells(lines[index]) else { break }
                     // 保存标准化后的表格行。
@@ -186,6 +196,8 @@ enum EnhancedMarkdownParser {
                     // 消费当前数据行。
                     index += 1
                 }
+                // 取消时不再组装可能很大的表格块。
+                guard !Task.isCancelled else { return [] }
                 // 输出完整 GFM 表格块。
                 blocks.append(
                     .init(
@@ -219,12 +231,14 @@ enum EnhancedMarkdownParser {
                 // 首个无序项已经写入结果，继续扫描剩余同类行。
                 index += 1
                 // 后续同类无序项保持在同一列表中。
-                while index < lines.count, let content = unorderedContent(lines[index]) {
+                while !Task.isCancelled, index < lines.count, let content = unorderedContent(lines[index]) {
                     // 去掉可选任务标记并保存勾选状态。
                     items.append(listItem(from: content))
                     // 消费当前列表行。
                     index += 1
                 }
+                // 取消时丢弃未完成的长列表。
+                guard !Task.isCancelled else { return [] }
                 // 输出完整无序列表。
                 blocks.append(.init(id: start, kind: .unorderedList(items)))
                 // 当前列表已经完整消费。
@@ -242,12 +256,14 @@ enum EnhancedMarkdownParser {
                 // 首个有序项已经写入结果，继续扫描剩余同类行。
                 index += 1
                 // 后续同类有序项保持在同一列表中。
-                while index < lines.count, let content = orderedContent(lines[index]) {
+                while !Task.isCancelled, index < lines.count, let content = orderedContent(lines[index]) {
                     // 去掉可选任务标记并保存勾选状态。
                     items.append(listItem(from: content.text))
                     // 消费当前列表行。
                     index += 1
                 }
+                // 取消时丢弃未完成的长列表。
+                guard !Task.isCancelled else { return [] }
                 // 输出带真实起始编号的有序列表。
                 blocks.append(.init(id: start, kind: .orderedList(start: startingNumber, items: items)))
                 // 当前列表已经完整消费。
@@ -263,12 +279,14 @@ enum EnhancedMarkdownParser {
                 // 首个引用行已经写入结果，继续扫描剩余连续引用。
                 index += 1
                 // 后续连续大于号行属于同一引用块。
-                while index < lines.count, let content = quoteContent(lines[index]) {
+                while !Task.isCancelled, index < lines.count, let content = quoteContent(lines[index]) {
                     // 保留引用内部换行以维持可读性。
                     quoteLines.append(content)
                     // 消费当前引用行。
                     index += 1
                 }
+                // 取消时不再拼接可能很大的引用正文。
+                guard !Task.isCancelled else { return [] }
                 // 输出完整引用块。
                 blocks.append(.init(id: start, kind: .quote(quoteLines.joined(separator: "\n"))))
                 // 当前引用已经完整消费。
@@ -282,7 +300,7 @@ enum EnhancedMarkdownParser {
             // 首行已经写入结果，后续扫描无需再次执行同一组分类函数。
             index += 1
             // 从第二行起扫描到空行或下一个明确块起点。
-            while index < lines.count, !isBlank(lines[index]),
+            while !Task.isCancelled, index < lines.count, !isBlank(lines[index]),
                 !startsBlock(lines: lines, at: index)
             {
                 // 普通行只在形成最终模型时复制。
@@ -290,10 +308,14 @@ enum EnhancedMarkdownParser {
                 // 消费当前段落行。
                 index += 1
             }
+            // 取消时不再拼接可能很大的段落正文。
+            guard !Task.isCancelled else { return [] }
             // 软换行按空格合并，符合常用 Markdown 显示行为。
             blocks.append(.init(id: start, kind: .paragraph(paragraphLines.joined(separator: " "))))
         }
 
+        // 返回前最后响应一次取消，避免边界竞态发布已经过期的完整结果。
+        guard !Task.isCancelled else { return [] }
         // 返回按原文顺序排列的增强块。
         return blocks
     }
@@ -332,8 +354,10 @@ enum EnhancedMarkdownParser {
     private static func isBlank(_ line: Substring) -> Bool {
         // 不创建修剪后的字符串即可完成空白判断。
         line.allSatisfy { character in
+            // 超长空白行扫描期间也应及时响应旧预览取消。
+            guard !Task.isCancelled else { return false }
             // Markdown 块边界只需识别常见横向空白。
-            character == " " || character == "\t"
+            return character == " " || character == "\t"
         }
     }
 
@@ -342,12 +366,12 @@ enum EnhancedMarkdownParser {
         // 从原切片开始收缩边界。
         var result = line
         // 移除左侧横向空白。
-        while let first = result.first, first == " " || first == "\t" {
+        while !Task.isCancelled, let first = result.first, first == " " || first == "\t" {
             // 丢弃首个空白字符。
             result = result.dropFirst()
         }
         // 移除右侧横向空白。
-        while let last = result.last, last == " " || last == "\t" {
+        while !Task.isCancelled, let last = result.last, last == " " || last == "\t" {
             // 丢弃末尾空白字符。
             result = result.dropLast()
         }
@@ -360,7 +384,7 @@ enum EnhancedMarkdownParser {
         // 从原切片开始移动左边界。
         var result = line
         // Markdown Lite 首版宽容任意常见缩进。
-        while let first = result.first, first == " " || first == "\t" {
+        while !Task.isCancelled, let first = result.first, first == " " || first == "\t" {
             // 丢弃首个缩进字符。
             result = result.dropFirst()
         }
@@ -438,6 +462,8 @@ enum EnhancedMarkdownParser {
         var markerCount = 0
         // 验证整行除空白外只含同一种标记。
         for character in trimmed {
+            // 超长候选分割线被取消时立即停止逐字符扫描。
+            guard !Task.isCancelled else { return false }
             // 同类标记计入有效数量。
             if character == marker {
                 // 累加标记数量。
@@ -478,7 +504,7 @@ enum EnhancedMarkdownParser {
         // 至少需要一个数字。
         var digitCount = 0
         // 只接受 ASCII 数字，避免 Int 转换遇到其他数字字符。
-        while cursor < trimmed.endIndex, trimmed[cursor].isASCII, trimmed[cursor].isNumber {
+        while !Task.isCancelled, cursor < trimmed.endIndex, trimmed[cursor].isASCII, trimmed[cursor].isNumber {
             // 累加数字位数。
             digitCount += 1
             // 移动到下一个字符。
@@ -636,6 +662,8 @@ enum EnhancedMarkdownParser {
         var escaping = false
         // 单次扫描完成拆分，避免正则表达式开销。
         for character in trimmed {
+            // 超宽表格行被取消时立即停止拆分。
+            guard !Task.isCancelled else { return nil }
             // 转义状态下保留被转义字符本身。
             if escaping {
                 // 非管道符转义继续保留反斜杠，避免改写原文。
@@ -689,7 +717,9 @@ enum EnhancedMarkdownParser {
             marker = marker.dropLast()
         }
         // GFM 对齐声明至少保留三个减号。
-        guard marker.count >= 3, marker.allSatisfy({ $0 == "-" }) else { return nil }
+        guard marker.count >= 3,
+            marker.allSatisfy({ !Task.isCancelled && $0 == "-" })
+        else { return nil }
         // 两侧冒号共同声明居中。
         if leadingColon && trailingColon {
             // 返回居中对齐。
@@ -713,6 +743,26 @@ enum EnhancedMarkdownParser {
         }
         // 缺少的尾部单元格使用空字符串补齐。
         return cells + Array(repeating: "", count: columnCount - cells.count)
+    }
+}
+
+// 用纯逻辑选择预览滚动锚点，避免视图层把光标提前跳到尚未经过的下一个块。
+enum EnhancedPreviewAnchor {
+    // 返回目标行之前最后一个块；目标位于首块之前时安全回退到首块。
+    static func blockID(in orderedBlockIDs: [Int], atOrBefore targetLine: Int) -> Int? {
+        // 空预览没有可滚动目标。
+        guard let firstBlockID = orderedBlockIDs.first else { return nil }
+        // 默认采用首块，覆盖目标行早于首块的防御性场景。
+        var selectedBlockID = firstBlockID
+        // 解析器按原文顺序输出递增行号，遇到目标之后的块即可停止。
+        for blockID in orderedBlockIDs {
+            // 目标之后的块不能成为当前章节的滚动锚点。
+            guard blockID <= targetLine else { break }
+            // 保存截至目标行最后出现的块。
+            selectedBlockID = blockID
+        }
+        // 返回不晚于目标行的稳定锚点。
+        return selectedBlockID
     }
 }
 
@@ -1384,10 +1434,15 @@ struct EnhancedMarkdownPreview: View {
                 // 正文与窗口边缘保持舒适留白。
                 .padding(28)
             }
-            // 大纲目标变化时定位到距离该行最近的已解析块。
+            // 大纲目标变化时定位到该行之前最后一个已解析块。
             .onChange(of: scrollTargetLine) { _, targetLine in
                 // nil 表示当前没有主动跳转请求。
-                guard let targetLine, let blockID = nearestBlockID(to: targetLine) else { return }
+                guard let targetLine,
+                    let blockID = EnhancedPreviewAnchor.blockID(
+                        in: blocks.map(\.id),
+                        atOrBefore: targetLine
+                    )
+                else { return }
                 // 使用短动画保持跳转方向可感知。
                 withAnimation(.easeInOut(duration: 0.18)) {
                     // 把目标块顶部对齐到预览可视区域顶部。
@@ -1395,21 +1450,6 @@ struct EnhancedMarkdownPreview: View {
                 }
             }
         }
-    }
-
-    // 查找距离目标行最近的解析块 ID。
-    private func nearestBlockID(to targetLine: Int) -> Int? {
-        // 空文档没有可滚动锚点。
-        guard let firstBlock = blocks.first else { return nil }
-        // 线性扫描只在用户点击大纲时发生，不进入输入热路径。
-        return blocks.dropFirst().reduce(firstBlock) { nearest, candidate in
-            // 使用 magnitude 避免负距离影响比较。
-            let nearestDistance = nearest.id >= targetLine ? nearest.id - targetLine : targetLine - nearest.id
-            // 计算候选块与目标行的绝对距离。
-            let candidateDistance = candidate.id >= targetLine ? candidate.id - targetLine : targetLine - candidate.id
-            // 距离更小时采用候选块，否则保留先出现的稳定锚点。
-            return candidateDistance < nearestDistance ? candidate : nearest
-        }.id
     }
 }
 
