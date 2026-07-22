@@ -1,5 +1,8 @@
 import AppKit
+import Darwin
+import Dispatch
 import Foundation
+import ImageIO
 import SwiftUI
 
 // 表示增强预览支持的任务状态。
@@ -836,6 +839,10 @@ private struct EnhancedListRow: View {
     let item: EnhancedListItem
     // 普通项显示圆点或真实编号。
     let marker: String
+    // 保存条目在 Markdown 源文件中的零基逻辑行。
+    let sourceLine: Int
+    // 预览可交互时把源行、正文和旧状态交给上层严格核对。
+    let onToggleTask: ((Int, String, Bool) -> Void)?
 
     // 构造紧凑且支持行内 Markdown 的列表行。
     var body: some View {
@@ -843,12 +850,30 @@ private struct EnhancedListRow: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             // 任务项使用系统复选框图标表达状态。
             if let taskState = item.taskState {
-                // 根据解析状态选择空框或选中图标。
-                Image(systemName: taskState == .checked ? "checkmark.square.fill" : "square")
-                    // 已完成任务使用强调色，未完成任务使用次级色。
-                    .foregroundStyle(taskState == .checked ? Color.accentColor : Color.secondary)
-                    // 图标提供稳定宽度，避免列表正文左右抖动。
-                    .frame(width: 16)
+                // 原生按钮同时提供鼠标、键盘和 VoiceOver 操作语义。
+                Button {
+                    // 未接入源文件动作的兼容预览保持安全空操作。
+                    guard let onToggleTask else { return }
+                    // 把解析快照一并回传，防止旧预览修改后来出现的新任务。
+                    onToggleTask(sourceLine, item.text, taskState == .checked)
+                } label: {
+                    // 根据解析状态选择空框或选中图标。
+                    Image(systemName: taskState == .checked ? "checkmark.square.fill" : "square")
+                        // 已完成任务使用强调色，未完成任务使用次级色。
+                        .foregroundStyle(taskState == .checked ? Color.accentColor : Color.secondary)
+                        // 图标提供稳定宽度，避免列表正文左右抖动。
+                        .frame(width: 16)
+                }
+                // 无边框样式保持原有列表排版和系统图标尺寸。
+                .buttonStyle(.plain)
+                // 旧调用方没有写回闭包时不伪装成可操作控件。
+                .disabled(onToggleTask == nil)
+                // VoiceOver 朗读真实任务正文而不是系统图标名称。
+                .accessibilityLabel(item.text.isEmpty ? "任务" : item.text)
+                // 当前完成状态作为独立值便于快速浏览任务列表。
+                .accessibilityValue(taskState == .checked ? "已完成" : "未完成")
+                // 明确操作会同步修改 Markdown 原文。
+                .accessibilityHint("切换任务状态并同步到 Markdown 原文")
             } else {
                 // 普通列表显示圆点或有序编号。
                 Text(marker)
@@ -934,19 +959,28 @@ enum EnhancedImageSourceResolver {
             break
         }
 
+        // 任何本地图片都必须依赖已经保存的 Markdown 文档位置建立安全根目录。
+        guard let documentURL, documentURL.isFileURL else { return nil }
+        // 文档同级目录是显式和相对本地图片共同的唯一安全根目录。
+        let documentDirectory = documentURL.deletingLastPathComponent().standardizedFileURL
+        // 解析文档目录真实路径，避免父目录软链接让字符串前缀产生错误边界。
+        let resolvedRoot = documentDirectory.resolvingSymlinksInPath().standardizedFileURL
+
         // 先识别带显式 scheme 的完整 URL。
         if let absoluteURL = URL(string: trimmedSource), let scheme = absoluteURL.scheme?.lowercased() {
-            // 显式 file URL 可表示用户主动引用的本机图片。
-            if scheme == "file", absoluteURL.isFileURL, isSupportedLocalImage(absoluteURL) {
-                // 标准化点路径段后交给本地异步加载器。
-                return absoluteURL.standardizedFileURL
-            }
             // data、javascript 等其他 scheme 一律拒绝。
-            return nil
+            guard scheme == "file", absoluteURL.isFileURL else { return nil }
+            // 显式 file URL 同样只接受明确图片扩展名。
+            guard isSupportedLocalImage(absoluteURL) else { return nil }
+            // 标准化点路径段后再解析全部既有软链接。
+            let resolvedCandidate =
+                absoluteURL.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+            // 显式地址的真实路径也必须严格位于当前文档目录内。
+            guard isStrictDescendant(resolvedCandidate, of: resolvedRoot) else { return nil }
+            // 返回真实文件地址，避免后续加载再次跟随已校验软链接。
+            return resolvedCandidate
         }
 
-        // 相对路径必须依赖当前已经保存的文档位置。
-        guard let documentURL, documentURL.isFileURL else { return nil }
         // 裸绝对路径必须改用显式 file URL，避免模糊权限边界。
         guard !trimmedSource.hasPrefix("/"), !trimmedSource.hasPrefix("~") else { return nil }
         // 未编码的查询或片段字符会改变 URL 语义，不作为本地文件名处理。
@@ -968,8 +1002,6 @@ enum EnhancedImageSourceResolver {
         // 反斜杠在跨平台 Markdown 中可能具有目录语义，因此不作为普通文件名接受。
         guard !decodedPath.contains("\\") else { return nil }
 
-        // 文档同级目录是相对图片引用的唯一安全根目录。
-        let documentDirectory = documentURL.deletingLastPathComponent().standardizedFileURL
         // 逐个安全组件追加，避免把完整字符串再次解释为绝对路径。
         var candidate = documentDirectory
         // 保持组件顺序构造最终本地地址。
@@ -982,14 +1014,12 @@ enum EnhancedImageSourceResolver {
         // 相对本地图片同样只接受明确图片扩展名。
         guard isSupportedLocalImage(candidate) else { return nil }
 
-        // 解析真实路径可识别 assets 软链接指向文档目录之外的情况。
-        let resolvedRoot = documentDirectory.resolvingSymlinksInPath().standardizedFileURL
         // 解析候选路径中的所有既有软链接成分。
         let resolvedCandidate = candidate.resolvingSymlinksInPath().standardizedFileURL
         // 候选真实地址必须严格位于文档目录内。
         guard isStrictDescendant(resolvedCandidate, of: resolvedRoot) else { return nil }
-        // 返回原始文档目录下的标准地址，保留用户可理解路径。
-        return candidate
+        // 返回真实文件地址，避免后续加载再次跟随已校验软链接。
+        return resolvedCandidate
     }
 
     // 判断本地地址是否使用允许的常见图片扩展名。
@@ -1007,7 +1037,241 @@ enum EnhancedImageSourceResolver {
     }
 }
 
-// 在后台读取本地图片数据，避免大图文件 IO 阻塞编辑输入线程。
+// 定义预览单张本地图片的硬性资源预算。
+struct EnhancedLocalImageLimits: Equatable, Sendable {
+    // 单张图片最多读取二十五 MiB，与可携带 HTML 的单图上限保持一致。
+    static let standard = EnhancedLocalImageLimits(
+        maximumByteCount: 25 * 1_024 * 1_024,
+        maximumPixelCount: 40_000_000,
+        maximumThumbnailPixelSize: 1_024
+    )
+
+    // 限制压缩文件字节数，避免稀疏文件或并发增长造成无界读取。
+    let maximumByteCount: Int64
+    // 限制源图宽高乘积，避免小体积解码炸弹耗尽内存。
+    let maximumPixelCount: Int64
+    // 限制实际解码缩略图最长边，预览无需保留超大原始位图。
+    let maximumThumbnailPixelSize: Int
+}
+
+// 保存已经在后台完成解码的不可变缩略图。
+struct EnhancedLocalImageThumbnail: @unchecked Sendable {
+    // CGImage 已由 ImageIO 强制解码，可安全交给主线程包装为 NSImage。
+    let cgImage: CGImage
+}
+
+// 使用有界文件读取和 ImageIO 在调用线程生成本地图片缩略图。
+enum EnhancedLocalImageDecoder {
+    // 最多同时处理两张本地图，把极端峰值控制在两份字节预算和缩略图内。
+    private static let decodeSlots = DispatchSemaphore(value: 2)
+
+    // 在 detached 后台任务执行同步解码，并把调用方取消显式传给 worker。
+    static func decodeThumbnailInBackground(
+        at url: URL,
+        limits: EnhancedLocalImageLimits = .standard
+    ) async -> EnhancedLocalImageThumbnail? {
+        // detached 保证文件读取和 ImageIO 不继承可能存在的 MainActor。
+        let worker = Task.detached(priority: .utility) {
+            // 同步实现会在排队、读取、元数据和解码阶段持续检查此 worker 的取消状态。
+            decodeThumbnail(at: url, limits: limits)
+        }
+        // 外层 SwiftUI `.task` 取消时必须主动终止不继承取消关系的 detached worker。
+        return await withTaskCancellationHandler {
+            // 正常路径等待同一后台 worker 返回缩略图或失败。
+            await worker.value
+        } onCancel: {
+            // 快速滚动或图片地址变化后不允许旧 worker 继续占用读取和解码槽位。
+            worker.cancel()
+        }
+    }
+
+    // 读取、校验并立即解码一张受控缩略图，任何失败都安全返回 nil。
+    static func decodeThumbnail(
+        at url: URL,
+        limits: EnhancedLocalImageLimits = .standard
+    ) -> EnhancedLocalImageThumbnail? {
+        // 只处理经过来源解析器认可的本地文件 URL。
+        guard url.isFileURL else { return nil }
+        // 非正预算无法容纳任何有效图片，直接拒绝异常调用参数。
+        guard limits.maximumByteCount > 0,
+            limits.maximumPixelCount > 0,
+            limits.maximumThumbnailPixelSize > 0
+        else { return nil }
+        // 当前实现需要把上限加一转换成 Int 以识别并发增长。
+        guard limits.maximumByteCount < Int64(Int.max) else { return nil }
+        // 已取消请求不能继续排队或占用正式解码并发名额。
+        guard acquireDecodeSlot() else { return nil }
+        // 当前图片完成或失败后立即唤醒下一张可见图片。
+        defer { decodeSlots.signal() }
+        // 获得槽位与开始打开文件之间仍需响应取消。
+        guard !Task.isCancelled else { return nil }
+
+        // 来源解析器已经返回打开前校验过的真实路径，此处只做不访问文件系统的标准化。
+        let expectedURL = url.standardizedFileURL
+        // O_NOFOLLOW 阻止安全解析后最终文件被瞬时替换为软链接。
+        let descriptor = url.withUnsafeFileSystemRepresentation { path in
+            // 无法形成文件系统路径时按打开失败处理。
+            guard let path else { return Int32(-1) }
+            // 只读且不跟随最终软链接，O_NONBLOCK 避免特殊节点阻塞。
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)
+        }
+        // 打开失败不再退回会跟随软链接的路径读取 API。
+        guard descriptor >= 0 else { return nil }
+        // FileHandle 接管描述符并负责最终关闭。
+        let fileHandle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        // 所有成功和失败路径都立即释放当前图片文件描述符。
+        defer { try? fileHandle.close() }
+
+        // F_GETPATH 从同一已打开对象取得实际路径，识别中间目录被瞬时替换的情况。
+        var openedPath = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        // 固定缓冲区接收内核返回的零结尾文件系统路径。
+        let pathResult = openedPath.withUnsafeMutableBufferPointer { buffer in
+            // 非空 MAXPATHLEN 缓冲区应始终拥有有效首地址。
+            guard let baseAddress = buffer.baseAddress else { return Int32(-1) }
+            // 使用非可变参数重载把原始缓冲区交给 macOS fcntl。
+            return Darwin.fcntl(
+                descriptor,
+                F_GETPATH,
+                UnsafeMutableRawPointer(baseAddress)
+            )
+        }
+        // 无法确认已打开对象的实际位置时不冒险读取内容。
+        guard pathResult == 0 else { return nil }
+        // 把内核实际路径转换为标准本地文件 URL。
+        let openedURL = openedPath.withUnsafeBufferPointer { buffer in
+            // F_GETPATH 成功保证首地址包含有效零结尾路径。
+            URL(
+                fileURLWithFileSystemRepresentation: buffer.baseAddress!,
+                isDirectory: false,
+                relativeTo: nil
+            ).standardizedFileURL
+        }
+        // 中间目录在 resolve 与 open 之间被替换时，实际打开路径会与预期目标不同。
+        guard openedURL.path == expectedURL.path else { return nil }
+
+        // fstat 对已经打开的同一对象读取类型和字节数，避免路径二次查询竞态。
+        var fileStatus = stat()
+        // 元数据读取失败时不尝试加载未知对象。
+        guard Darwin.fstat(descriptor, &fileStatus) == 0 else { return nil }
+        // 目录、FIFO、设备和 socket 都不能进入图片读取循环。
+        guard (fileStatus.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else { return nil }
+        // 负数文件大小属于异常元数据。
+        guard fileStatus.st_size >= 0 else { return nil }
+        // 在任何内容分配前拒绝超过正式字节预算的文件。
+        guard Int64(fileStatus.st_size) <= limits.maximumByteCount else { return nil }
+
+        // 上限加一字节足以发现 fstat 后继续增长的文件。
+        let stopByteCount = Int(limits.maximumByteCount) + 1
+        // 正常文件按 fstat 大小预留容量但绝不超过硬上限。
+        var data = Data()
+        // 预留仅减少扩容，不触发超过正式预算的内存申请。
+        data.reserveCapacity(min(Int(fileStatus.st_size), Int(limits.maximumByteCount)))
+        // 以固定小块读取，避免单次临时分配整份大文件。
+        while data.count < stopByteCount {
+            // SwiftUI 取消不可见图片任务时及时停止后台工作。
+            guard !Task.isCancelled else { return nil }
+            // 当前块包含最多一个用于证明超限的额外字节。
+            let chunkByteCount = min(64 * 1_024, stopByteCount - data.count)
+            // 保存当前块，读取错误与正常文件末尾需要分开处理。
+            let chunk: Data
+            // 始终从同一已校验描述符继续读取。
+            do {
+                // nil 或空数据都表示普通文件已经完整读到末尾。
+                guard let readChunk = try fileHandle.read(upToCount: chunkByteCount),
+                    !readChunk.isEmpty
+                else { break }
+                // 成功读取的非空块进入统一追加路径。
+                chunk = readChunk
+            } catch {
+                // 系统读取错误不能产生部分图片。
+                return nil
+            }
+            // 把当前有界块追加到待识别图片数据。
+            data.append(chunk)
+        }
+        // 文件在 fstat 后增长时，上限加一字节会触发拒绝。
+        guard data.count <= Int(limits.maximumByteCount) else { return nil }
+        // 空文件不可能形成有效图片。
+        guard !data.isEmpty else { return nil }
+        // 读取完成后再次响应视图取消。
+        guard !Task.isCancelled else { return nil }
+
+        // 创建图片源时禁止隐式缓存原始全尺寸位图。
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        // ImageIO 只从受字节预算保护的内存读取图片元数据和像素。
+        guard let imageSource = CGImageSourceCreateWithData(data as CFData, sourceOptions) else {
+            return nil
+        }
+        // 至少需要一帧才能生成预览缩略图。
+        guard CGImageSourceGetCount(imageSource) > 0 else { return nil }
+        // 图片源识别完成后若视图已经离屏，不再读取宽高元数据。
+        guard !Task.isCancelled else { return nil }
+        // 先读取首帧宽高元数据，在实际解码前执行像素预算。
+        guard
+            let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as NSDictionary?,
+            let widthNumber = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+            let heightNumber = properties[kCGImagePropertyPixelHeight] as? NSNumber
+        else { return nil }
+        // 转成有符号整数便于执行正值和溢出检查。
+        let pixelWidth = widthNumber.int64Value
+        // 高度与宽度使用相同安全表示。
+        let pixelHeight = heightNumber.int64Value
+        // 零或负尺寸不是可显示图片。
+        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+        // 溢出安全乘法避免恶意尺寸绕过像素上限。
+        let (pixelCount, didPixelCountOverflow) = pixelWidth.multipliedReportingOverflow(
+            by: pixelHeight
+        )
+        // 乘法溢出或总像素超过预算时不进入解码。
+        guard !didPixelCountOverflow, pixelCount <= limits.maximumPixelCount else { return nil }
+        // 像素预算通过后仍先处理取消，避免进入最昂贵的位图生成阶段。
+        guard !Task.isCancelled else { return nil }
+
+        // 最长边不超过正式缩略图尺寸，同时不放大小图。
+        let thumbnailPixelSize = min(
+            Int64(limits.maximumThumbnailPixelSize),
+            max(pixelWidth, pixelHeight)
+        )
+        // 正尺寸图片和正预算应始终得到至少一个像素。
+        guard thumbnailPixelSize > 0, thumbnailPixelSize <= Int64(Int.max) else { return nil }
+        // ImageIO 在当前后台线程完成旋转、缩放和像素缓存。
+        let thumbnailOptions =
+            [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: Int(thumbnailPixelSize),
+                kCGImageSourceShouldCacheImmediately: true,
+            ] as CFDictionary
+        // 强制生成受最长边约束的已解码位图。
+        guard
+            let cgImage = CGImageSourceCreateThumbnailAtIndex(
+                imageSource,
+                0,
+                thumbnailOptions
+            )
+        else { return nil }
+        // ImageIO 调用无法中途打断，返回后必须丢弃已取消请求的结果。
+        guard !Task.isCancelled else { return nil }
+        // 把不可变缩略图交给主线程状态层展示。
+        return EnhancedLocalImageThumbnail(cgImage: cgImage)
+    }
+
+    // 以短超时轮询取得全局解码槽位，使排队中的取消无需等待其他大图完成。
+    private static func acquireDecodeSlot() -> Bool {
+        // 只有取得槽位或当前任务取消才结束等待。
+        while !Task.isCancelled {
+            // 二十毫秒轮询兼顾取消响应与低调度开销。
+            if decodeSlots.wait(timeout: .now() + .milliseconds(20)) == .success {
+                // 成功调用方负责通过 defer 归还唯一槽位。
+                return true
+            }
+        }
+        // 取消请求不会再进入文件读取或 ImageIO。
+        return false
+    }
+}
+
+// 在后台读取并解码本地图片，避免文件 IO 或 ImageIO 阻塞编辑输入线程。
 @MainActor
 private final class EnhancedLocalImageLoader: ObservableObject {
     // 保存加载成功的系统图片。
@@ -1027,15 +1291,18 @@ private final class EnhancedLocalImageLoader: ObservableObject {
         failed = false
         // 记录当前请求地址以抑制重复任务。
         loadedURL = url
-        // 文件读取放到低优先级后台任务并使用安全内存映射选项。
-        let data = await Task.detached(priority: .utility) {
-            // 读取失败返回 nil，由主线程统一展示回退内容。
-            try? Data(contentsOf: url, options: .mappedIfSafe)
-        }.value
+        // 后台入口显式传播 SwiftUI 取消，并把同时读取解码限制为两张图片。
+        let thumbnail = await EnhancedLocalImageDecoder.decodeThumbnailInBackground(at: url)
         // SwiftUI 取消不可见块任务时不更新过期状态。
         guard !Task.isCancelled, loadedURL == url else { return }
-        // 在主线程把不可变数据转换为 AppKit 图片对象。
-        image = data.flatMap(NSImage.init(data:))
+        // 主线程只把已经解码的不可变 CGImage 包装为 AppKit 展示对象。
+        image = thumbnail.map {
+            // 以像素尺寸创建 NSImage，SwiftUI 后续仅负责布局缩放。
+            NSImage(
+                cgImage: $0.cgImage,
+                size: NSSize(width: $0.cgImage.width, height: $0.cgImage.height)
+            )
+        }
         // nil 表示文件缺失、权限不足或内容无法解码。
         failed = image == nil
     }
@@ -1278,13 +1545,21 @@ struct EnhancedPreviewBlockView: View {
     let block: EnhancedPreviewBlock
     // 保存当前文档位置供图片块解析相对路径。
     let documentURL: URL?
+    // 任务项点击时把精确解析快照交给当前文档动作。
+    let onToggleTask: ((Int, String, Bool) -> Void)?
 
-    // 允许旧调用方不传文档位置，并为新调用方开放相对图片基址。
-    init(block: EnhancedPreviewBlock, documentURL: URL? = nil) {
+    // 允许旧调用方省略文档位置和任务动作，保持只读预览兼容。
+    init(
+        block: EnhancedPreviewBlock,
+        documentURL: URL? = nil,
+        onToggleTask: ((Int, String, Bool) -> Void)? = nil
+    ) {
         // 保存解析完成的预览块。
         self.block = block
         // 保存可选文档位置。
         self.documentURL = documentURL
+        // 保存可选任务切换动作。
+        self.onToggleTask = onToggleTask
     }
 
     // 根据块类型选择对应原生组件。
@@ -1307,21 +1582,31 @@ struct EnhancedPreviewBlockView: View {
                 // 段落占满预览宽度并左对齐。
                 .frame(maxWidth: .infinity, alignment: .leading)
         case let .unorderedList(items):
-            // 列表内部保持紧凑垂直间距。
-            VStack(alignment: .leading, spacing: 7) {
+            // 长列表按可见范围延迟创建交互按钮，避免一次生成数万无障碍节点。
+            LazyVStack(alignment: .leading, spacing: 7) {
                 // 按稳定数组索引渲染每个列表项。
                 ForEach(items.indices, id: \.self) { index in
                     // 普通无序项使用圆点，任务项由行视图改用复选框。
-                    EnhancedListRow(item: items[index], marker: "•")
+                    EnhancedListRow(
+                        item: items[index],
+                        marker: "•",
+                        sourceLine: block.id + index,
+                        onToggleTask: onToggleTask
+                    )
                 }
             }
         case let .orderedList(start, items):
-            // 有序列表内部保持紧凑垂直间距。
-            VStack(alignment: .leading, spacing: 7) {
+            // 有序长列表同样延迟创建每行视图并保持原编号计算。
+            LazyVStack(alignment: .leading, spacing: 7) {
                 // 按稳定数组索引渲染每个列表项。
                 ForEach(items.indices, id: \.self) { index in
                     // 从原文起始编号连续生成可见编号。
-                    EnhancedListRow(item: items[index], marker: "\(start + index).")
+                    EnhancedListRow(
+                        item: items[index],
+                        marker: "\(start + index).",
+                        sourceLine: block.id + index,
+                        onToggleTask: onToggleTask
+                    )
                 }
             }
         case let .quote(text):
@@ -1398,12 +1683,15 @@ struct EnhancedMarkdownPreview: View {
     let documentURL: URL?
     // 保存大纲或编辑器请求跳转的零基行号。
     let scrollTargetLine: Int?
+    // 保存任务清单写回当前活动源文件的可选动作。
+    let onToggleTask: ((Int, String, Bool) -> Void)?
 
     // 提供兼容旧调用的默认文档地址和滚动目标参数。
     init(
         blocks: [EnhancedPreviewBlock],
         documentURL: URL? = nil,
-        scrollTargetLine: Int? = nil
+        scrollTargetLine: Int? = nil,
+        onToggleTask: ((Int, String, Bool) -> Void)? = nil
     ) {
         // 保存解析层生成的块数组。
         self.blocks = blocks
@@ -1411,6 +1699,8 @@ struct EnhancedMarkdownPreview: View {
         self.documentURL = documentURL
         // 保存由大纲或编辑器提供的可选目标行号。
         self.scrollTargetLine = scrollTargetLine
+        // 保存可选任务动作，nil 时继续提供兼容只读预览。
+        self.onToggleTask = onToggleTask
     }
 
     // 使用单一滚动容器承载所有块。
@@ -1424,9 +1714,13 @@ struct EnhancedMarkdownPreview: View {
                     // 稳定行号 ID 帮助 SwiftUI 复用未变化块。
                     ForEach(blocks) { block in
                         // 把当前模型映射为对应增强视图。
-                        EnhancedPreviewBlockView(block: block, documentURL: documentURL)
-                            // 显式块 ID 作为 ScrollViewReader 的跳转锚点。
-                            .id(block.id)
+                        EnhancedPreviewBlockView(
+                            block: block,
+                            documentURL: documentURL,
+                            onToggleTask: onToggleTask
+                        )
+                        // 显式块 ID 作为 ScrollViewReader 的跳转锚点。
+                        .id(block.id)
                     }
                 }
                 // 所有预览文本允许原生选择和复制。

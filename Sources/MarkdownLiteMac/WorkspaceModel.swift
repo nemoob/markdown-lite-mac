@@ -3,6 +3,52 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+// 描述 dirty 标签关闭时允许展示的安全动作组合。
+enum WorkspaceDirtyClosePolicy: Equatable {
+    // 未命名标签只能先保存，取消时继续保留标签。
+    case saveOnly
+    // 原文件仍可作为恢复入口时允许保留路径草稿后关闭。
+    case saveOrKeepDraft
+    // 原文件失去恢复能力时必须另存为，取消时继续保留标签。
+    case saveAsOnly
+
+    // 根据文件身份和最新磁盘状态选择不会制造孤儿草稿的关闭策略。
+    static func resolve(
+        hasFileURL: Bool,
+        externalState: ExternalDocumentChangeState
+    ) -> WorkspaceDirtyClosePolicy {
+        // 未命名标签没有稳定路径恢复入口，只允许保存或取消。
+        guard hasFileURL else { return .saveOnly }
+        // 已命名标签必须按最新磁盘可达性决定是否允许草稿关闭。
+        switch externalState {
+        case .unchanged, .modified:
+            // 文件仍存在时最近文件或原路径可以重新触达恢复草稿。
+            return .saveOrKeepDraft
+        case .deleted, .unreadable, .notMonitored:
+            // 文件缺失、不可读或状态异常时保守要求另存为。
+            return .saveAsOnly
+        }
+    }
+
+    // 返回关闭确认框的首要安全动作标题。
+    var primaryButtonTitle: String {
+        // 只有失去原路径恢复能力时明确引导另存为。
+        self == .saveAsOnly ? "另存为" : "保存"
+    }
+
+    // 判断首要动作是否必须进入另存为面板。
+    var usesSaveAs: Bool {
+        // 仅 saveAsOnly 跳过可能被外部状态阻止的原地保存。
+        self == .saveAsOnly
+    }
+
+    // 判断确认框能否提供“保留草稿并关闭”。
+    var allowsDraftClose: Bool {
+        // 只有原文件仍可作为恢复入口时允许关闭到路径草稿。
+        self == .saveOrKeepDraft
+    }
+}
+
 // 管理多标签顺序、活动标签、文件去重和会话恢复。
 @MainActor
 final class WorkspaceModel: ObservableObject {
@@ -19,17 +65,26 @@ final class WorkspaceModel: ObservableObject {
     private let documentStore: DocumentSupportStore
     // 会话层只保存标签身份、顺序和活动 UUID。
     private let sessionStore: WorkspaceSessionStore
+    // 最近文件写入通过闭包隔离，测试可稳定注入辅助索引失败。
+    private let recordRecentDocument: (URL) throws -> Void
 
     // 默认恢复上次会话；测试可注入隔离存储并关闭恢复。
     init(
         documentStore: DocumentSupportStore = DocumentSupportStore(),
         sessionStore: WorkspaceSessionStore = WorkspaceSessionStore(),
-        restoresSession: Bool = true
+        restoresSession: Bool = true,
+        recordRecentDocument: ((URL) throws -> Void)? = nil
     ) {
         // 保存共享文档支撑层。
         self.documentStore = documentStore
         // 保存会话支撑层。
         self.sessionStore = sessionStore
+        // 生产环境写入正式索引，测试可只替换这项辅助元数据操作。
+        self.recordRecentDocument =
+            recordRecentDocument ?? { fileURL in
+                // 默认路径保持现有最近文件排序和持久化语义。
+                try documentStore.recordRecentDocument(fileURL)
+            }
         // 先刷新最近文件，标签恢复失败也不影响菜单。
         refreshRecentDocuments()
         // 按调用方配置恢复会话或创建首次标签。
@@ -107,28 +162,45 @@ final class WorkspaceModel: ObservableObject {
         guard let closingIndex = documents.firstIndex(where: { $0.id == document.id }) else { return }
         // dirty 标签必须让用户明确选择。
         if document.isDirty {
+            // 已命名标签在关闭前重新检查磁盘，避免把删除或不可读文件当作恢复入口。
+            let externalState =
+                document.currentFileURL == nil
+                ? ExternalDocumentChangeState.notMonitored
+                : document.checkForExternalChanges()
+            // 将磁盘可达性转换成可单测的安全动作组合。
+            let closePolicy = WorkspaceDirtyClosePolicy.resolve(
+                hasFileURL: document.currentFileURL != nil,
+                externalState: externalState
+            )
             // 创建原生关闭确认框。
             let alert = NSAlert()
             // 标签名明确指出受影响对象。
             alert.messageText = "关闭“\(document.filename)”？"
             // 未命名标签没有可重新打开的文件身份，因此只能保存或取消。
             alert.informativeText =
-                document.currentFileURL == nil
+                closePolicy == .saveOnly
                 ? "未命名文档必须先保存到文件，关闭后才能可靠找回。"
-                : "文档尚未保存。可以保存到文件，或保留恢复草稿后关闭标签。"
-            // 第一项保存真实文件。
-            alert.addButton(withTitle: "保存")
+                : closePolicy == .saveAsOnly
+                    ? "原文件已删除或无法读取。请另存为到可访问位置；取消将继续保留标签。"
+                    : "文档尚未保存。可以保存到文件，或保留恢复草稿后关闭标签。"
+            // 第一项按原文件可达性保存或引导安全另存为。
+            alert.addButton(withTitle: closePolicy.primaryButtonTitle)
             // 默认安全取消。
             alert.addButton(withTitle: "取消")
-            // 只有已命名文件能通过最近文件重新触达恢复草稿。
-            if document.currentFileURL != nil {
+            // 只有原文件仍可作为恢复入口时才允许关闭到路径草稿。
+            if closePolicy.allowsDraftClose {
                 alert.addButton(withTitle: "保留草稿并关闭")
             }
             // 根据用户明确选择处理。
             switch alert.runModal() {
             case .alertFirstButtonReturn:
-                // 保存失败或另存为取消时保持标签打开。
-                guard document.saveDocumentIfPossible() else { return }
+                // 缺失或不可读的原路径必须改用另存为，避免普通保存被冲突保护阻止后误关。
+                let didSave =
+                    closePolicy.usesSaveAs
+                    ? document.saveDocumentAsIfPossible()
+                    : document.saveDocumentIfPossible()
+                // 保存失败或另存为取消时保持正文和标签可触达。
+                guard didSave else { return }
             case .alertThirdButtonReturn:
                 // 草稿失败时默认阻止关闭，避免无提示丢失。
                 guard document.ensureRecoverableDraft() else {
@@ -232,7 +304,7 @@ final class WorkspaceModel: ObservableObject {
                 // 保留原对象、正文、撤销关联和预览任务。
                 activate(existing)
                 // 最近访问顺序仍应更新。
-                try? documentStore.recordRecentDocument(url)
+                try? recordRecentDocument(url)
                 // 刷新菜单。
                 refreshRecentDocuments()
                 // 明确反馈没有产生重复标签。
@@ -240,30 +312,44 @@ final class WorkspaceModel: ObservableObject {
                 // 继续处理下一 URL。
                 continue
             }
+            // 将真实文件打开与后续辅助元数据更新隔离，后者失败不能反转已打开结果。
+            let document: EditorModel
             do {
                 // 创建独立标签并处理这个路径的恢复草稿。
-                guard let document = try EditorModel.open(at: url, documentStore: documentStore) else {
+                guard let openedDocument = try EditorModel.open(at: url, documentStore: documentStore) else {
                     // 用户取消草稿选择时继续处理其他 URL。
                     continue
                 }
-                // 建立工作区回调。
-                document.workspace = self
-                // 新文件追加到标签末尾。
-                documents.append(document)
-                // 最近成功打开的文件成为活动标签。
-                activeDocumentID = document.id
-                // 更新最近文件索引。
-                try documentStore.recordRecentDocument(url)
-                // 刷新打开菜单。
-                refreshRecentDocuments()
-                // 保存新增标签和活动 UUID。
-                persistSession()
-                // 反馈打开完成。
-                status = "文件已打开"
+                // 保存已经成功创建的标签对象供后续主流程使用。
+                document = openedDocument
             } catch {
                 // 单文件失败不破坏已有标签。
                 status = "打开失败：\(error.localizedDescription)"
+                // 继续处理下一 URL。
+                continue
             }
+            // 建立工作区回调。
+            document.workspace = self
+            // 新文件追加到标签末尾。
+            documents.append(document)
+            // 最近成功打开的文件成为活动标签。
+            activeDocumentID = document.id
+            // 默认辅助索引尚未更新成功。
+            var recentDocumentWasUpdated = false
+            do {
+                // 最近文件索引失败只能影响菜单顺序，不能回滚内存标签。
+                try recordRecentDocument(url)
+                // 记录辅助索引已经同步。
+                recentDocumentWasUpdated = true
+            } catch {
+                // 保留 false，交由最终状态准确提示辅助更新失败。
+            }
+            // 无论索引写入是否成功都重新读取菜单状态。
+            refreshRecentDocuments()
+            // 无论索引写入是否成功都保存新增标签和活动 UUID。
+            persistSession()
+            // 明确区分完整成功与最近文件辅助索引失败。
+            status = recentDocumentWasUpdated ? "文件已打开" : "文件已打开，最近文件更新失败"
         }
     }
 

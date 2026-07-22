@@ -122,8 +122,15 @@ struct RegressionSelfChecksTests {
         // 标题快捷键提示必须完整覆盖 Command-Option-1 到 6。
         #expect(headingEntries.map(\.shortcutHint) == (1...6).map { "⌘⌥\($0)" })
 
+        // 任务状态作为独立块级动作复用同一原生格式路由。
+        let taskEntry = EditorFormattingMenuContent.taskEntry
+        // 菜单必须把任务项连接到纯逻辑切换命令。
+        #expect(taskEntry.command == .toggleTask)
+        // 可见快捷键必须与应用菜单注册的 Command-Shift-X 一致。
+        #expect(taskEntry.shortcutHint == "⌘⇧X")
+
         // 合并所有菜单项便于统一检查可发现性描述。
-        let allEntries = inlineEntries + headingEntries
+        let allEntries = inlineEntries + [taskEntry] + headingEntries
         // 每项稳定标识必须唯一，避免 SwiftUI 复用错误动作。
         #expect(Set(allEntries.map(\.id)).count == allEntries.count)
         // 所有动作都必须提供非空标题、快捷键和帮助说明。

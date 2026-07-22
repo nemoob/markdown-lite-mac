@@ -1,0 +1,35 @@
+name: Feature request / 功能建议
+description: Suggest a focused improvement for Markdown Lite / 提议一项聚焦改进
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: User scenario / 使用场景
+      description: What task is difficult today, and who benefits from improving it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome / 期望结果
+      description: Describe the smallest useful result rather than a specific implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered / 已考虑的替代方案
+      description: Share any current workaround or simpler alternative.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist / 检查项
+      options:
+        - label: I searched existing issues and confirmed this request does not disclose private or security-sensitive information.
+          required: true
