@@ -85,7 +85,7 @@ enum EnhancedMarkdownParser {
         // 仅在必要时统一 Windows 和旧式 Mac 换行，常见输入不产生副本。
         let normalized: String
         // 含回车的文档需要转换为单一换行格式。
-        if markdown.contains("\r") {
+        if markdown.utf8.contains(13) {
             // 先处理 Windows 双字符换行，再处理残余单回车。
             normalized =
                 markdown
@@ -138,7 +138,7 @@ enum EnhancedMarkdownParser {
                     index += 1
                 }
                 // 仅在生成模型时把代码切片合并为独立字符串。
-                let code = codeLines.map(String.init).joined(separator: "\n")
+                let code = codeLines.joined(separator: "\n")
                 // 输出带语言提示的代码块。
                 blocks.append(.init(id: start, kind: .code(language: fence.language, text: code)))
                 // 当前代码块已完整消费。
@@ -211,12 +211,14 @@ enum EnhancedMarkdownParser {
             }
 
             // 连续无序项组成一个列表块。
-            if unorderedContent(line) != nil {
+            if let firstContent = unorderedContent(line) {
                 // 保存列表起始行作为稳定块 ID。
                 let start = index
-                // 收集普通列表项和任务列表项。
-                var items: [EnhancedListItem] = []
-                // 同类无序项保持在同一列表中。
+                // 复用首次识别结果，避免同一首行再次解析和复制正文。
+                var items = [listItem(from: firstContent)]
+                // 首个无序项已经写入结果，继续扫描剩余同类行。
+                index += 1
+                // 后续同类无序项保持在同一列表中。
                 while index < lines.count, let content = unorderedContent(lines[index]) {
                     // 去掉可选任务标记并保存勾选状态。
                     items.append(listItem(from: content))
@@ -235,9 +237,11 @@ enum EnhancedMarkdownParser {
                 let start = index
                 // 原文首个编号用于正确显示非 1 起始列表。
                 let startingNumber = firstItem.number
-                // 收集有序列表中的普通项和任务项。
-                var items: [EnhancedListItem] = []
-                // 同类有序项保持在同一列表中。
+                // 复用首次识别结果，避免同一首行再次解析编号和复制正文。
+                var items = [listItem(from: firstItem.text)]
+                // 首个有序项已经写入结果，继续扫描剩余同类行。
+                index += 1
+                // 后续同类有序项保持在同一列表中。
                 while index < lines.count, let content = orderedContent(lines[index]) {
                     // 去掉可选任务标记并保存勾选状态。
                     items.append(listItem(from: content.text))
@@ -251,12 +255,14 @@ enum EnhancedMarkdownParser {
             }
 
             // 连续引用行组成一个引用块。
-            if quoteContent(line) != nil {
+            if let firstContent = quoteContent(line) {
                 // 保存引用起始行作为稳定块 ID。
                 let start = index
-                // 收集去掉引用标记后的正文。
-                var quoteLines: [String] = []
-                // 连续大于号行属于同一引用块。
+                // 复用首次识别结果，避免同一首行再次解析和复制正文。
+                var quoteLines = [firstContent]
+                // 首个引用行已经写入结果，继续扫描剩余连续引用。
+                index += 1
+                // 后续连续大于号行属于同一引用块。
                 while index < lines.count, let content = quoteContent(lines[index]) {
                     // 保留引用内部换行以维持可读性。
                     quoteLines.append(content)
@@ -271,22 +277,17 @@ enum EnhancedMarkdownParser {
 
             // 剩余连续普通文本合并成一个段落。
             let start = index
-            // 段落通常很短，按小容量预留即可。
-            var paragraphLines: [String] = []
-            // 扫描到空行或下一个明确块起点。
+            // 当前行已经完整通过全部块分类，直接作为段落首行复用。
+            var paragraphLines = [String(line)]
+            // 首行已经写入结果，后续扫描无需再次执行同一组分类函数。
+            index += 1
+            // 从第二行起扫描到空行或下一个明确块起点。
             while index < lines.count, !isBlank(lines[index]),
-                !startsBlock(lines: lines, at: index, allowParagraph: true)
+                !startsBlock(lines: lines, at: index)
             {
                 // 普通行只在形成最终模型时复制。
                 paragraphLines.append(String(lines[index]))
                 // 消费当前段落行。
-                index += 1
-            }
-            // 防御未知语法误判导致未消费任何行。
-            if paragraphLines.isEmpty {
-                // 把当前行作为普通段落保底，确保扫描必然前进。
-                paragraphLines.append(String(lines[index]))
-                // 消费保底段落行。
                 index += 1
             }
             // 软换行按空格合并，符合常用 Markdown 显示行为。
@@ -298,7 +299,7 @@ enum EnhancedMarkdownParser {
     }
 
     // 判断段落扫描是否遇到新的明确块起点。
-    private static func startsBlock(lines: [Substring], at index: Int, allowParagraph: Bool) -> Bool {
+    private static func startsBlock(lines: [Substring], at index: Int) -> Bool {
         // 当前调用只处理有效行号。
         let line = lines[index]
         // 空行始终结束当前段落。
@@ -323,8 +324,8 @@ enum EnhancedMarkdownParser {
             // 返回明确块边界。
             return true
         }
-        // 首个普通行属于当前段落，调用方可显式允许它。
-        return !allowParagraph
+        // 普通文本继续归入当前段落。
+        return false
     }
 
     // 判断一行是否只含空格或制表符。
