@@ -20,8 +20,8 @@ bash Scripts/check.sh
 
 ```bash
 swift build --disable-sandbox -Xswiftc -warnings-as-errors
-swift test --disable-sandbox -Xswiftc -warnings-as-errors
-swift run --disable-sandbox MarkdownLiteMac --self-check
+swift test --disable-sandbox --no-parallel -Xswiftc -warnings-as-errors
+swift run --configuration release --disable-sandbox -Xswiftc -warnings-as-errors MarkdownLiteMac --self-check
 bash -n Scripts/package-app.sh
 plutil -lint Support/Info.plist
 ```

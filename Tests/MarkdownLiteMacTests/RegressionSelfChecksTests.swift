@@ -52,20 +52,24 @@ struct RegressionSelfChecksTests {
         #expect(failures.isEmpty)
     }
 
-    // Markdown 结构识别和两档长文档性能目标必须分别进入测试报告。
-    @Test("Markdown 结构与性能")
-    func testMarkdownStructureAndPerformance() {
-        // 关闭内部硬中止，让 Swift Testing 分别报告每个失败指标。
+    // Markdown 结构和两档完整基准样本必须进入标准测试报告。
+    @Test("Markdown 结构与基准样本")
+    func testMarkdownStructureAndBenchmarkSamples() {
+        // Debug 测试进程只验证结构与样本完整性，发布性能由随后独立 release 自检门禁。
         let report = EnhancedMarkdownSelfCheck.run(
             printResults: false,
             enforcePerformanceTargets: false
         )
         // 增强块类型样例必须保持完整识别。
         #expect(report.blockTypesValid)
-        // 约 200KB 文档必须低于 50ms 目标。
-        #expect(report.mediumDocument.passed)
-        // 约 1MB 文档必须低于 200ms 目标。
-        #expect(report.largeDocument.passed)
+        // 中档样本必须完整覆盖至少 200KB、真实块输出和既定 50ms 门槛。
+        #expect(report.mediumDocument.actualBytes >= 200_000)
+        #expect(report.mediumDocument.blockCount > 0)
+        #expect(report.mediumDocument.targetMilliseconds == 50)
+        // 大档样本必须完整覆盖至少 1MB、真实块输出和既定 200ms 门槛。
+        #expect(report.largeDocument.actualBytes >= 1_000_000)
+        #expect(report.largeDocument.blockCount > report.mediumDocument.blockCount)
+        #expect(report.largeDocument.targetMilliseconds == 200)
     }
 
     // 文档末尾空行必须可以通过标题快捷键直接开始新标题。

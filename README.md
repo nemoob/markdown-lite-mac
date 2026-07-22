@@ -53,16 +53,16 @@ bash Scripts/check.sh
 单独运行完整自检：
 
 ```bash
-swift run --disable-sandbox MarkdownLiteMac --self-check
+swift run --configuration release --disable-sandbox MarkdownLiteMac --self-check
 ```
 
 单独执行 SwiftPM 测试入口：
 
 ```bash
-swift test --disable-sandbox -Xswiftc -warnings-as-errors
+swift test --disable-sandbox --no-parallel -Xswiftc -warnings-as-errors
 ```
 
-`Scripts/check.sh` 会在本机仅选择 Command Line Tools、但已安装标准 Xcode 时自动使用 Xcode 工具链。标准 SwiftPM 测试覆盖文件冲突保护和既有回归自检；`--self-check` 另外输出可复核的性能数据。
+`Scripts/check.sh` 会在本机仅选择 Command Line Tools、但已安装标准 Xcode 时自动使用 Xcode 工具链。标准 SwiftPM 测试串行覆盖文件冲突保护、既有回归和完整基准样本；release 配置的独立 `--self-check` 另外输出并强制验证可复核的性能数据。
 
 生成本地 `.app`：
 
@@ -95,7 +95,7 @@ open dist/MarkdownLiteMac.app
 - 200KB：小于 50ms
 - 1MB：小于 200ms
 
-这些数字只衡量 Markdown 解析器，不代表从键盘输入、语法着色到界面渲染的端到端延迟。编辑输入采用短延迟合并，解析在后台任务执行，过期结果不会覆盖新正文。不同机器和系统负载会影响绝对耗时，提交前应以 `--self-check` 的本机及 CI 结果为准。
+这些数字只衡量 Markdown 解析器，不代表从键盘输入、语法着色到界面渲染的端到端延迟。CI 使用与最终应用一致的 release 配置，在独立进程中执行完整预热、三次解析中位数和块数校验；标准测试进程负责确定性功能与基准样本完整性。编辑输入采用短延迟合并，解析在后台任务执行，过期结果不会覆盖新正文。
 
 ## 隐私
 
