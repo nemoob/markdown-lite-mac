@@ -122,6 +122,45 @@ enum NativeEditorActions {
         return true
     }
 
+    // 从预览点击安全切换指定源文件行，并拒绝活动标签或解析快照不匹配。
+    @discardableResult
+    static func toggleTask(
+        atLine sourceLine: Int,
+        expectedSource: String,
+        expectedText: String,
+        expectedChecked: Bool,
+        documentID: UUID? = nil
+    ) -> Bool {
+        // 编辑器尚未创建时不能修改任何源文件。
+        guard let textView else { return false }
+        // 预览所属标签必须仍是当前活动编辑器，避免切换期间串写。
+        if let documentID, documentID != activeDocumentID { return false }
+        // 外部重载或输入法可能让模型和 NSTextView 短暂不同，点击低频路径执行逐字节全文核对。
+        guard !NativeTextComparison.differsExactly(textView.string, expectedSource) else { return false }
+        // 保留当前编辑器光标，预览点击只改变任务状态而不打断写作位置。
+        let preservedSelection = textView.selectedRange()
+        // 同时核对源行、任务正文和旧状态，过期预览只能安全空操作。
+        guard
+            let edit = MarkdownTaskToggleSupport.edit(
+                in: textView.string,
+                line: sourceLine,
+                expectedText: expectedText,
+                expectedChecked: expectedChecked,
+                preserving: preservedSelection
+            )
+        else { return false }
+        // 任务切换前结束连续输入合并，使一次点击形成独立撤销动作。
+        textView.breakUndoCoalescing()
+        // 通过 NSTextView 输入入口执行单字符替换并通知模型绑定。
+        textView.insertText(edit.replacement, replacementRange: edit.replacementRange)
+        // 等长替换后恢复原写作光标，避免预览操作抢走源文件位置。
+        textView.setSelectedRange(edit.selectionAfterEdit)
+        // 再次结束合并，后续键盘输入不会与任务点击共同撤销。
+        textView.breakUndoCoalescing()
+        // 明确报告任务状态已经同步到源文件。
+        return true
+    }
+
     // 返回活动编辑器当前光标所在的零基逻辑行。
     static func currentLine(documentID: UUID? = nil) -> Int? {
         // 编辑器尚未创建时没有源位置。
@@ -272,10 +311,10 @@ enum NativeTextComparison {
         return lhs != rhs
     }
 
-    // 执行可能为 O(n) 的严格正文核对，只允许后台任务调用。
+    // 执行可能为 O(n) 的严格正文核对，只允许后台任务或低频明确操作调用。
     static func differsExactly(_ lhs: String, _ rhs: String) -> Bool {
-        // Swift 字符串相等语义保证中部等长替换也能识别。
-        lhs != rhs
+        // 逐 UTF-8 字节比较可区分 NFC/NFD 等规范等价但原始编码不同的正文。
+        !lhs.utf8.elementsEqual(rhs.utf8)
     }
 }
 

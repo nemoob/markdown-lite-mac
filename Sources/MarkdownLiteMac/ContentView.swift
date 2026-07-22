@@ -23,7 +23,7 @@ enum EditorFormattingMenuContent {
     // tooltip 简述菜单不会直接改写选区以外的内容。
     static let helpText = "为选区或当前行应用 Markdown 格式"
     // 无障碍提示列出菜单覆盖的完整能力。
-    static let accessibilityHint = "打开粗体、斜体、行内代码、链接和一到六级标题格式菜单"
+    static let accessibilityHint = "打开粗体、斜体、行内代码、链接、任务状态和一到六级标题格式菜单"
 
     // 高频行内格式保持在一级菜单，减少日常操作层级。
     static let inlineEntries: [EditorFormattingMenuEntry] = [
@@ -60,6 +60,15 @@ enum EditorFormattingMenuContent {
             command: .link
         ),
     ]
+
+    // 任务切换单独列出，明确它只处理当前已有任务行。
+    static let taskEntry = EditorFormattingMenuEntry(
+        id: "toggle-task",
+        title: "切换任务状态",
+        shortcutHint: "⌘⇧X",
+        helpText: "切换当前行已有 Markdown 任务的完成状态",
+        command: .toggleTask
+    )
 
     // 六级标题放入子菜单，保持编辑栏和一级菜单紧凑。
     static let headingEntries: [EditorFormattingMenuEntry] = (1...6).map { level in
@@ -351,6 +360,9 @@ private struct WorkspaceEditorView: View {
                 formattingButton(for: entry)
             }
             Divider()
+            // 任务状态复用原生单字符替换和撤销路径。
+            formattingButton(for: EditorFormattingMenuContent.taskEntry)
+            Divider()
             // 标题级别放入子菜单，避免一级菜单过长。
             Menu("标题") {
                 // 一到六级标题全部复用现有转换命令。
@@ -441,7 +453,19 @@ private struct WorkspaceEditorView: View {
                 EnhancedMarkdownPreview(
                     blocks: document.previewBlocks,
                     documentURL: document.currentFileURL,
-                    scrollTargetLine: previewTargetLine
+                    scrollTargetLine: previewTargetLine,
+                    onToggleTask: { sourceLine, expectedText, expectedChecked in
+                        // 正文已变化但新预览尚未完成时拒绝旧复选框操作。
+                        guard document.isPreviewCurrent else { return }
+                        // 原生编辑器继续核对标签、源行、正文和旧状态后执行可撤销替换。
+                        NativeEditorActions.toggleTask(
+                            atLine: sourceLine,
+                            expectedSource: document.text,
+                            expectedText: expectedText,
+                            expectedChecked: expectedChecked,
+                            documentID: document.id
+                        )
+                    }
                 )
                 // 文档切换时重建预览树，避免远程图片确认状态跨标签复用。
                 .id(document.id)

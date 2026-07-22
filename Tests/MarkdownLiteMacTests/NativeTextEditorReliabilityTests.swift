@@ -152,6 +152,95 @@ struct NativeTextEditorReliabilityTests {
         #expect(reconciliationCount == 2)
     }
 
+    // 预览复选框必须只修改当前标签，并形成一条可撤销的原生文本动作。
+    @Test("任务预览按标签安全切换并可撤销")
+    func testPreviewTaskToggleUsesNativeUndo() throws {
+        // 创建真实窗口级撤销管理器和一份任务正文。
+        let window = makeWindow()
+        // 当前活动标签的原生编辑器保存未完成任务。
+        let textView = makeTextView(text: "前言\n- [ ] 当前任务\n结尾")
+        // 文本视图进入窗口后才能获得与应用一致的撤销管理器。
+        window.contentView?.addSubview(textView)
+        // 创建可验证 SwiftUI 绑定同步的正文盒子。
+        let modelText = TextBox(textView.string)
+        // 正式协调器负责把原生替换回写到模型。
+        let coordinator = makeCoordinator(text: modelText)
+        // 测试结束前清理异步任务和全局活动编辑器引用。
+        defer {
+            coordinator.tearDown()
+            NativeEditorActions.unregister(textView)
+        }
+        // 连接正式文本变化代理。
+        textView.delegate = coordinator
+        // 记录初始正文避免协调器误判整体替换。
+        coordinator.recordInitialText(modelText.value)
+        // 使用稳定 UUID 模拟当前活动标签身份。
+        let documentID = UUID()
+        // 注册当前文本视图作为应用命令目标。
+        NativeEditorActions.register(textView, documentID: documentID, isActive: true)
+        // 把写作光标留在首行，验证预览点击不会抢走位置。
+        let preservedSelection = NSRange(location: 1, length: 0)
+        // 应用测试前设置真实当前选区。
+        textView.setSelectedRange(preservedSelection)
+
+        // 错误标签身份必须在任何文本系统调用前拒绝。
+        let wrongDocumentResult = NativeEditorActions.toggleTask(
+            atLine: 1,
+            expectedSource: textView.string,
+            expectedText: "当前任务",
+            expectedChecked: false,
+            documentID: UUID()
+        )
+        // 错误标签不能报告成功。
+        #expect(wrongDocumentResult == false)
+        // 正文保持未完成状态。
+        #expect(textView.string == "前言\n- [ ] 当前任务\n结尾")
+        // 模型快照与原生正文不一致时必须拒绝，避免延迟整体重载被旧视图覆盖。
+        let staleSourceResult = NativeEditorActions.toggleTask(
+            atLine: 1,
+            expectedSource: "前言\n- [ ] 当前任务\n旧结尾",
+            expectedText: "当前任务",
+            expectedChecked: false,
+            documentID: documentID
+        )
+        // 即使目标行本身仍相同，全文版本不同也不能写回。
+        #expect(staleSourceResult == false)
+        // 严格版本拒绝后原生正文保持不变。
+        #expect(textView.string == "前言\n- [ ] 当前任务\n结尾")
+
+        // 无事件循环测试显式建立一次点击对应的撤销分组。
+        let undoManager = try #require(window.undoManager)
+        // 开始独立任务切换分组。
+        undoManager.beginUndoGrouping()
+        // 使用匹配的标签和解析快照执行正式预览动作。
+        let didToggle = NativeEditorActions.toggleTask(
+            atLine: 1,
+            expectedSource: textView.string,
+            expectedText: "当前任务",
+            expectedChecked: false,
+            documentID: documentID
+        )
+        // 完成本次原生动作分组。
+        undoManager.endUndoGrouping()
+        // 正确点击必须报告成功。
+        #expect(didToggle)
+        // 原生正文只改变方括号中的状态字符。
+        #expect(textView.string == "前言\n- [x] 当前任务\n结尾")
+        // 文本代理必须同步更新模型正文和后续 dirty 路径。
+        #expect(modelText.value == textView.string)
+        // 预览点击不得移动原编辑选区。
+        #expect(textView.selectedRange() == preservedSelection)
+
+        // 一次撤销必须完整回退本次任务点击。
+        undoManager.undo()
+        // 正文恢复未完成状态。
+        #expect(textView.string == "前言\n- [ ] 当前任务\n结尾")
+        // 一次重做必须重新应用同一状态切换。
+        undoManager.redo()
+        // 正文重新变成完成状态。
+        #expect(textView.string == "前言\n- [x] 当前任务\n结尾")
+    }
+
     // 直接修改 NSTextStorage 后发送 NSTextView 正式文本变化通知。
     private func replaceTextStorage(of textView: NSTextView, with text: String) {
         // NSTextStorage setter 不经过用户输入撤销注册，适合隔离测试 delegate 来源判断。

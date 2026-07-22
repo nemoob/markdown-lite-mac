@@ -167,6 +167,12 @@ struct MarkdownLiteMacApp: App {
                 }
                 .keyboardShortcut("k", modifiers: .command)
                 Divider()
+                // 当前行已有任务标记时执行单步可撤销状态切换。
+                Button("切换任务状态") {
+                    NativeEditorActions.applyFormatting(.toggleTask, documentID: workspace.activeDocumentID)
+                }
+                .keyboardShortcut("x", modifiers: [.command, .shift])
+                Divider()
                 // 一到六级标题使用统一快捷键规则，避免增加格式工具栏噪声。
                 ForEach(1...6, id: \.self) { level in
                     Button("\(level) 级标题") {

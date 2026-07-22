@@ -57,6 +57,11 @@ final class EditorModel: ObservableObject, Identifiable {
     @Published private(set) var externalChangeState: ExternalDocumentChangeState
     // 每个标签独立保存预览显示偏好。
     @Published var isPreviewVisible = true
+    // 只有解析结果与当前正文代次一致时，预览中的写回动作才可执行。
+    var isPreviewCurrent: Bool {
+        // 已应用代次落后表示界面仍展示旧正文的预览块。
+        appliedPreviewGeneration == previewGeneration
+    }
 
     // 工作区弱引用只用于兼容现有工具栏入口，不形成循环持有。
     weak var workspace: WorkspaceModel?
@@ -78,6 +83,8 @@ final class EditorModel: ObservableObject, Identifiable {
     private var previewTask: Task<Void, Never>?
     // 每个标签独立递增版本，过期结果不会跨标签回写。
     private var previewGeneration = 0
+    // 保存当前 previewBlocks 实际对应的正文代次，供交互预览拒绝旧动作。
+    private var appliedPreviewGeneration = -1
     // 每个标签独立节流草稿写入。
     private var draftTimer: Timer?
     // 自动草稿完整编码和磁盘写入在后台任务执行。
@@ -604,6 +611,8 @@ final class EditorModel: ObservableObject, Identifiable {
             guard !Task.isCancelled, let result else { return }
             // 只有同一标签最新版本可以回写。
             guard let self, self.previewGeneration == generation else { return }
+            // 先标记结果所属代次，随后发布的块视图即可安全开放交互。
+            self.appliedPreviewGeneration = generation
             // 更新当前标签预览块。
             self.previewBlocks = result.0
             // 更新当前标签解析耗时。

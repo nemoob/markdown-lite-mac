@@ -10,6 +10,8 @@ enum MarkdownEditorFormattingCommand: Equatable, Sendable {
     case inlineCode
     // 把选区转换成带待填写地址的链接。
     case link
+    // 切换当前逻辑行已有任务标记的完成状态。
+    case toggleTask
     // 把选区覆盖的逻辑行转换为指定级别标题。
     case heading(level: Int)
 }
@@ -50,6 +52,16 @@ enum MarkdownFormattingSupport {
             return wrappingEdit(in: content, selection: selection, prefix: "`", suffix: "`")
         case .link:
             return linkEdit(in: content, selection: selection)
+        case .toggleTask:
+            // 当前行任务切换复用带原文校验的纯逻辑入口。
+            return MarkdownTaskToggleSupport.edit(
+                in: source,
+                line: MarkdownSourceLineMap.lineNumber(
+                    in: source,
+                    utf16Location: selection.location
+                ),
+                preserving: selection
+            )
         case let .heading(level):
             return headingEdit(in: content, selection: selection, level: level)
         }
@@ -274,6 +286,101 @@ enum MarkdownFormattingSupport {
         guard let match = expression.firstMatch(in: line, range: range) else { return 0 }
         // 返回匹配标记长度供正文切片和光标映射复用。
         return match.range.length
+    }
+}
+
+// 生成只替换任务勾选字符的安全编辑计划，供菜单和预览共同复用。
+enum MarkdownTaskToggleSupport {
+    // 模式严格匹配解析器已经接受的无序或有序任务行，并捕获状态和正文。
+    private static let taskLineExpression = try! NSRegularExpression(
+        pattern: #"^[ \t]*(?:[-+*]|([0-9]+)[.)])[ \t]\[([ xX])\] (.*)$"#
+    )
+
+    // 定位零基逻辑行并在预期内容仍匹配时生成等长状态替换。
+    static func edit(
+        in source: String,
+        line targetLine: Int,
+        expectedText: String? = nil,
+        expectedChecked: Bool? = nil,
+        preserving selection: NSRange
+    ) -> MarkdownFormattingEdit? {
+        // 负行号不代表任何真实预览条目。
+        guard targetLine >= 0 else { return nil }
+        // NSTextView 与 NSString 使用相同 UTF-16 坐标。
+        let content = source as NSString
+        // 目标行起点复用经过混合换行验证的映射逻辑。
+        let lineLocation = MarkdownSourceLineMap.utf16Location(in: source, line: targetLine)
+        // 越过文末的行号会被映射到 EOF，必须通过反向行号核对拒绝。
+        guard MarkdownSourceLineMap.lineNumber(in: source, utf16Location: lineLocation) == targetLine else {
+            return nil
+        }
+        // 取得完整逻辑行边界，同时把 CRLF 等换行符排除在匹配范围外。
+        var lineStart = 0
+        var contentsEnd = 0
+        content.getLineStart(
+            &lineStart,
+            end: nil,
+            contentsEnd: &contentsEnd,
+            for: NSRange(location: lineLocation, length: 0)
+        )
+        // 空行和异常反向范围都不可能包含任务标记。
+        guard contentsEnd >= lineStart else { return nil }
+        // 只读取当前行正文，保证替换不会触碰原换行风格。
+        let lineRange = NSRange(location: lineStart, length: contentsEnd - lineStart)
+        // 在原始全文坐标中匹配，捕获范围可直接交给 NSTextView。
+        guard
+            let match = taskLineExpression.firstMatch(in: source, range: lineRange),
+            match.range == lineRange,
+            match.numberOfRanges == 4
+        else { return nil }
+        // 第一捕获组仅在有序列表中保存原始十进制编号。
+        let orderedNumberRange = match.range(at: 1)
+        // 第二捕获组是方括号中的单个空格、x 或 X。
+        let stateRange = match.range(at: 2)
+        // 第三捕获组是解析器展示的完整任务正文。
+        let textRange = match.range(at: 3)
+        // 防御正则引擎返回缺失捕获组。
+        guard stateRange.location != NSNotFound, textRange.location != NSNotFound else { return nil }
+        // 有序编号必须与解析器一样可以装入 Int，超长数字继续按普通正文处理。
+        if orderedNumberRange.location != NSNotFound,
+            Int(content.substring(with: orderedNumberRange)) == nil
+        {
+            return nil
+        }
+        // 读取当前勾选字符以统一大小写完成状态。
+        let stateMarker = content.substring(with: stateRange)
+        // 空格表示未完成，大小写 x 都表示已完成。
+        let isChecked = stateMarker.lowercased() == "x"
+        // 预览动作必须确认当前状态仍等于解析时状态，双击旧视图会安全停止。
+        if let expectedChecked, expectedChecked != isChecked { return nil }
+        // 读取当前任务正文供过期预览和行移动校验。
+        let taskText = content.substring(with: textRange)
+        // 预览展示内容变化后不能把旧点击应用到新正文。
+        if let expectedText, expectedText != taskText { return nil }
+        // 等长单字符替换不会改变任何既有 UTF-16 选区坐标。
+        let safeSelection = normalizedSelection(selection, contentLength: content.length)
+        // 已完成任务切回空格，未完成任务统一写为小写 x。
+        let replacement = isChecked ? " " : "x"
+        // 返回一次最小替换，保留缩进、编号、正文和换行符。
+        return MarkdownFormattingEdit(
+            replacementRange: stateRange,
+            replacement: replacement,
+            selectionAfterEdit: safeSelection
+        )
+    }
+
+    // 把可能来自失效视图的选区限制在当前正文边界内。
+    private static func normalizedSelection(_ selection: NSRange, contentLength: Int) -> NSRange {
+        // NSNotFound 无法交给 NSTextView，回退到文末光标。
+        guard selection.location != NSNotFound else {
+            return NSRange(location: contentLength, length: 0)
+        }
+        // 起点限制在零到文末之间。
+        let location = min(contentLength, max(0, selection.location))
+        // 长度不能越过当前正文末尾。
+        let length = min(max(0, selection.length), contentLength - location)
+        // 返回可直接恢复的 UTF-16 选区。
+        return NSRange(location: location, length: length)
     }
 }
 
@@ -702,6 +809,14 @@ enum MarkdownEditorSupportSelfCheck {
         // 后台严格核对必须识别这次真实外部变化。
         if !NativeTextComparison.differsExactly(originalEchoText, externalMiddleReplacement) {
             failures.append("同签名外部替换未被严格核对识别")
+        }
+        // NFC 单码位和 NFD 组合标记视觉相同但原始 UTF-8 字节不同。
+        let normalizedNFC = "é"
+        // 显式组合重音覆盖 Swift 字符串规范等价语义。
+        let normalizedNFD = "e\u{301}"
+        // 数据保护核对必须保留两种原始编码序列的差异。
+        if !NativeTextComparison.differsExactly(normalizedNFC, normalizedNFD) {
+            failures.append("Unicode 规范等价正文未按原始字节区分")
         }
         // 样例在语法前放置 emoji，验证 UTF-16 坐标不按 Character 错算。
         let sample = "😀 前缀\n# 标题\n> 引用 **粗体** *斜体* `代码` [链接](https://example.com)\n```swift\n**代码内不高亮**\n```\n"

@@ -1,0 +1,61 @@
+name: Bug report / 缺陷报告
+description: Report a reproducible problem in Markdown Lite / 报告可复现的问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Markdown Lite. For security or privacy vulnerabilities, follow [SECURITY.md](https://github.com/nemoob/markdown-lite-mac/security/policy) instead of opening a public issue.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem / 问题描述
+      description: What happened, and what did you expect?
+      placeholder: Describe the actual and expected behavior without including private document content or local paths.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      placeholder: |
+        1. Open ...
+        2. Choose ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Markdown Lite version or commit / 版本或提交
+      placeholder: v0.6.0 or commit SHA
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment / 环境
+      description: Include macOS version, Mac architecture, and how the app was built.
+      placeholder: macOS 15.5, Apple Silicon, built from source with Swift 6.1
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context / 补充信息
+      description: Add sanitized logs, screenshots, or a minimal sample if useful.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist / 检查项
+      options:
+        - label: I searched existing issues and removed private document content, account details, and local paths.
+          required: true
