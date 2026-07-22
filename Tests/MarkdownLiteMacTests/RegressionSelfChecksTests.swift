@@ -98,4 +98,38 @@ struct RegressionSelfChecksTests {
         // 光标应落在标题标记之后供用户立即输入。
         #expect(edit.selectionAfterEdit == NSRange(location: selection.location + 3, length: 0))
     }
+
+    // 编辑栏格式菜单必须完整描述并路由现有原生格式命令。
+    @Test("编辑栏格式菜单路由")
+    func testEditorFormattingMenuContent() {
+        // 读取一级菜单的四项高频行内格式。
+        let inlineEntries = EditorFormattingMenuContent.inlineEntries
+        // 一级菜单命令顺序应匹配用户最常用的格式顺序。
+        #expect(inlineEntries.map(\.command) == [.bold, .italic, .inlineCode, .link])
+        // 快捷键提示必须与应用命令保持一致。
+        #expect(inlineEntries.map(\.shortcutHint) == ["⌘B", "⌘I", "⌘E", "⌘K"])
+
+        // 读取标题子菜单的全部级别。
+        let headingEntries = EditorFormattingMenuContent.headingEntries
+        // 标题子菜单必须完整覆盖 H1 到 H6。
+        #expect(headingEntries.map(\.title) == (1...6).map { "H\($0) 标题" })
+        // 每一级标题必须路由到对应的现有格式命令。
+        #expect(headingEntries.map(\.command) == (1...6).map { .heading(level: $0) })
+        // 标题快捷键提示必须完整覆盖 Command-Option-1 到 6。
+        #expect(headingEntries.map(\.shortcutHint) == (1...6).map { "⌘⌥\($0)" })
+
+        // 合并所有菜单项便于统一检查可发现性描述。
+        let allEntries = inlineEntries + headingEntries
+        // 每项稳定标识必须唯一，避免 SwiftUI 复用错误动作。
+        #expect(Set(allEntries.map(\.id)).count == allEntries.count)
+        // 所有动作都必须提供非空标题、快捷键和帮助说明。
+        #expect(
+            allEntries.allSatisfy {
+                !$0.title.isEmpty && !$0.shortcutHint.isEmpty && !$0.helpText.isEmpty
+            })
+        // 菜单入口本身也必须提供 tooltip 和无障碍描述。
+        #expect(!EditorFormattingMenuContent.helpText.isEmpty)
+        #expect(!EditorFormattingMenuContent.accessibilityLabel.isEmpty)
+        #expect(!EditorFormattingMenuContent.accessibilityHint.isEmpty)
+    }
 }

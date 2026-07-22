@@ -363,12 +363,12 @@ enum AssetSupportSelfCheck {
             )
             // file URL 标准化结果应保持目标地址。
             precondition(resolvedFileURL == first.destinationURL, "file URL 图片解析错误")
-            // 现有 HTTPS 图片地址必须原样交给系统异步加载。
+            // 未确认的 HTTPS 图片不能从本地解析器取得可加载地址。
             let remoteSource = "https://example.com/image.png"
-            // 远程地址不依赖当前文档位置。
+            // 远程图片必须由预览确认分支单独持有请求地址。
             precondition(
-                EnhancedImageSourceResolver.resolve(remoteSource, documentURL: nil)?.absoluteString == remoteSource,
-                "HTTPS 图片解析错误"
+                EnhancedImageSourceResolver.resolve(remoteSource, documentURL: nil) == nil,
+                "HTTPS 图片绕过了确认策略"
             )
 
             // 第二次导入同名源文件不得覆盖第一次结果。
