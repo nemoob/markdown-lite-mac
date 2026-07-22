@@ -90,6 +90,8 @@ private struct WorkspaceHostView: View {
 struct MarkdownLiteMacApp: App {
     // AppKit delegate 在 willTerminate 之前提供可取消的退出钩子。
     @NSApplicationDelegateAdaptor(MarkdownLiteApplicationDelegate.self) private var applicationDelegate
+    // 正常进程全生命周期持有独占锁，避免第二实例写同一份恢复数据。
+    private let instanceLock: ApplicationInstanceLock
     // 单窗口共享同一份多标签工作区。
     @StateObject private var workspace: WorkspaceModel
 
@@ -99,6 +101,44 @@ struct MarkdownLiteMacApp: App {
         if CommandLine.arguments.contains("--self-check") {
             runSelfCheck()
             exit(EXIT_SUCCESS)
+        }
+        // 必须在 WorkspaceModel 读取或写入用户恢复数据之前取得进程锁。
+        do {
+            // 默认锁与工作区会话固定使用同一产品目录。
+            instanceLock = try ApplicationInstanceLock()
+        } catch {
+            // 锁竞争与 IO 故障都通过原生提示明确阻止本次启动。
+            let alert = NSAlert()
+            // 已运行实例提供直接结论，其他故障说明数据保护原因。
+            if error as? ApplicationInstanceLockError == .alreadyRunning {
+                // 第二实例不创建工作区，也不会触碰草稿或会话。
+                alert.messageText = "Markdown Lite 已在运行"
+                // 引导用户回到首实例继续编辑。
+                alert.informativeText = "为避免多个进程同时写入恢复数据，本次启动已取消。请切换到已经打开的 Markdown Lite。"
+            } else {
+                // 无法确认互斥时按数据安全优先级关闭式失败。
+                alert.messageText = "无法安全启动 Markdown Lite"
+                // 计算固定恢复目录，只展示应用元数据位置而不暴露任何正文。
+                let storageDirectory = WorkspaceSessionStore.defaultRootDirectory(
+                    fileManager: .default
+                )
+                // 拼出可操作的失败说明，避免用户在不清楚原因时反复启动。
+                let lockFailureDescription = """
+                    无法取得恢复数据进程锁，本次启动已取消。请检查下列目录的权限、磁盘空间和锁文件类型后重试：
+
+                    \(storageDirectory.path)
+
+                    \(error.localizedDescription)
+                    """
+                // 提供目录、常见检查项和底层错误，用户可以修复后安全重试。
+                alert.informativeText = lockFailureDescription
+            }
+            // 单按钮提示不提供绕过锁继续运行的危险入口。
+            alert.addButton(withTitle: "退出")
+            // 同步展示提示后才结束进程，确保用户能看到失败原因。
+            alert.runModal()
+            // 锁失败路径绝不创建 WorkspaceModel。
+            exit(EXIT_FAILURE)
         }
         // 正常启动时创建并恢复工作区模型。
         _workspace = StateObject(wrappedValue: WorkspaceModel())

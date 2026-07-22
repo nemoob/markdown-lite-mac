@@ -208,6 +208,11 @@ private struct WorkspaceEditorView: View {
     var body: some View {
         VStack(spacing: 0) {
             topToolbar
+            // 双代会话都损坏时持续展示可执行恢复入口，状态栏文案变化不会把它隐藏。
+            if workspace.hasUnrecoverableSessionFailure {
+                Divider()
+                sessionRecoveryWarning
+            }
             Divider()
             DocumentTabBar(workspace: workspace)
             Divider()
@@ -303,6 +308,92 @@ private struct WorkspaceEditorView: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 52)
+    }
+
+    // 用紧凑醒目的横幅解释风险，并提供查看证据和安全重建两个动作。
+    private var sessionRecoveryWarning: some View {
+        HStack(spacing: 10) {
+            // 橙色警告图标建立高于普通状态栏的视觉优先级。
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            // 两行文字同时说明现状和下一步，不挤占主要编辑区域。
+            VStack(alignment: .leading, spacing: 1) {
+                // 标题明确当前会话无法自动恢复。
+                Text("会话恢复失败")
+                    .font(.caption.weight(.semibold))
+                // 说明当前标签尚在内存，提醒用户及时完成闭环。
+                Text("当前标签仅保存在内存中；可先查看损坏文件，再归档并重建会话。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            // 让动作保持靠右且不压缩风险说明到不可读。
+            Spacer(minLength: 8)
+            // Finder 动作只展示证据，不改变任何会话文件。
+            Button("在 Finder 中显示", action: workspace.revealSessionRecoveryData)
+                .controlSize(.small)
+                .accessibilityLabel("在 Finder 中显示损坏的会话数据")
+                .accessibilityHint("显示现存的会话恢复文件，不修改任何数据")
+            // 重建动作必须经过二次确认后才归档原始文件并创建新会话。
+            Button("归档并重建", action: confirmSessionArchiveAndRebuild)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(.orange)
+                .accessibilityLabel("归档损坏会话并重建")
+                .accessibilityHint("确认后保留损坏文件副本，并用当前打开标签重建会话")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .background(Color.orange.opacity(0.12))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("会话恢复失败，当前标签仅保存在内存中")
+    }
+
+    // 二次确认会归档原始证据，但不会尝试从损坏 JSON 猜测内容。
+    private func confirmSessionArchiveAndRebuild() {
+        // 使用原生警告框提供明确默认取消动作。
+        let alert = NSAlert()
+        // 标题说明即将执行的两个阶段。
+        alert.messageText = "归档损坏的会话数据并重建？"
+        // 明确新会话只采用当前可见标签，现存损坏代会移入独立归档目录。
+        alert.informativeText = "现存的损坏会话恢复文件将保留到独立归档目录；新会话会采用目前打开的标签顺序和活动标签。"
+        // 第一按钮保持安全取消，防止回车直接改变磁盘布局。
+        alert.addButton(withTitle: "取消")
+        // 第二按钮与横幅动作同名，降低确认歧义。
+        alert.addButton(withTitle: "归档并重建")
+        // 只有用户明确选择第二项才执行模型层原子恢复流程。
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        // 模型统一负责草稿保护、归档、重建和最终状态发布。
+        guard workspace.archiveCorruptedSessionAndRebuild() else {
+            // 原生警告框让键盘和 VoiceOver 用户都能立即获知失败，而非只依赖状态栏。
+            let failureAlert = NSAlert()
+            // 标题保持简短，详细原因继续来自模型的确定状态。
+            failureAlert.messageText = "会话归档重建失败"
+            // 展示原会话目录和底层错误，便于用户保留证据后重试。
+            failureAlert.informativeText = workspace.status
+            // 单按钮只关闭提示，不提供绕过数据保护的危险动作。
+            failureAlert.addButton(withTitle: "好")
+            // 同步展示确保恢复横幅仍在时用户已明确收到失败反馈。
+            failureAlert.runModal()
+            // 失败后不进入成功提示和 Finder 归档流程。
+            return
+        }
+        // 成功后立即展示归档位置，避免横幅关闭让用户失去结果反馈。
+        let completionAlert = NSAlert()
+        // 标题确认会话已经重新具备持久化能力。
+        completionAlert.messageText = "会话已安全重建"
+        // 精确目录仅在本机展示，便于用户备份原始损坏文件。
+        completionAlert.informativeText = "原始会话恢复文件已保存在：\n\n\(workspace.lastSessionArchiveURL?.path ?? "恢复归档目录")"
+        // 第一按钮结束流程，不默认打开其他应用。
+        completionAlert.addButton(withTitle: "完成")
+        // 第二按钮提供归档完成后的持续可达入口。
+        completionAlert.addButton(withTitle: "在 Finder 中显示归档")
+        // 用户明确选择第二项时定位本次精确归档目录。
+        if completionAlert.runModal() == .alertSecondButtonReturn {
+            // Finder 动作不修改任何归档或新会话数据。
+            workspace.revealLastSessionArchive()
+        }
     }
 
     // 导出菜单同时暴露完整 HTML 和两套公众号模板。
@@ -504,6 +595,17 @@ private struct WorkspaceEditorView: View {
             // 外部修改只在模型确认冲突后展示显式解决入口。
             if document.externalChangeState.blocksRegularSave {
                 externalConflictMenu
+            }
+            // 成功归档后保留紧凑入口，同时让正文保存状态继续正常更新。
+            if workspace.lastSessionArchiveURL != nil {
+                // Finder 动作只定位最近归档，不修改恢复文件或当前会话。
+                Button(action: workspace.revealLastSessionArchive) {
+                    // 文件夹图标和短标签在状态栏内保持可识别且不过度占宽。
+                    Label("恢复归档", systemImage: "folder")
+                }
+                .buttonStyle(.plain)
+                .help("在 Finder 中显示最近一次会话恢复归档")
+                .accessibilityLabel("在 Finder 中显示最近一次会话恢复归档")
             }
             Text("预览 \(document.renderMilliseconds, specifier: "%.1f") ms")
         }

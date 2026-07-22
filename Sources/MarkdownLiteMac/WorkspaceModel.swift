@@ -60,6 +60,10 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var recentDocuments: [RecentDocument] = []
     // 会话或打开失败时提供非破坏性反馈。
     @Published private(set) var status = "已就绪"
+    // 双代会话都无法恢复时持续发布显式状态，直到用户安全重建成功。
+    @Published private(set) var hasUnrecoverableSessionFailure = false
+    // 保存最近一次成功归档目录，横幅关闭后仍可由完成提示在 Finder 中定位。
+    @Published private(set) var lastSessionArchiveURL: URL?
 
     // 所有标签共享文档 IO 和草稿存储。
     private let documentStore: DocumentSupportStore
@@ -405,6 +409,66 @@ final class WorkspaceModel: ObservableObject {
         return allDraftsSaved && sessionSaved
     }
 
+    // 在 Finder 中定位仍保留的损坏会话代，便于用户先备份或人工检查。
+    func revealSessionRecoveryData() {
+        // 优先选择实际存在的 current 和 previous 文件，让证据直接可见。
+        let generationURLs = sessionStore.existingGenerationURLs
+        // 两代文件都不存在时退回显示会话目录，避免按钮无响应。
+        let revealedURLs = generationURLs.isEmpty ? [sessionStore.storageDirectoryURL] : generationURLs
+        // 使用系统 Finder 同时选择全部可用恢复入口。
+        NSWorkspace.shared.activateFileViewerSelecting(revealedURLs)
+    }
+
+    // 在 Finder 中定位最近一次成功归档，供完成提示继续提供可达入口。
+    func revealLastSessionArchive() {
+        // 没有成功归档时保持幂等，不能误打开普通会话目录。
+        guard let lastSessionArchiveURL else { return }
+        // 选择精确归档目录，便于用户立即备份或检查原始文件。
+        NSWorkspace.shared.activateFileViewerSelecting([lastSessionArchiveURL])
+    }
+
+    // 归档损坏双代并用当前内存标签顺序重建可继续持久化的会话。
+    @discardableResult
+    func archiveCorruptedSessionAndRebuild(
+        date: Date = Date(),
+        identifier: UUID = UUID()
+    ) -> Bool {
+        // 只有启动恢复已确认不可恢复时才允许执行破坏性重建入口。
+        guard hasUnrecoverableSessionFailure else { return false }
+        // 新尝试开始前清除旧结果，失败时不能把上一次路径误当成本次成功。
+        lastSessionArchiveURL = nil
+        // 重建会话前先保存每个 dirty 标签正文，避免 UUID 映射落盘但内容仍只在内存。
+        for document in documents where !document.flushDraftIfNeeded() {
+            // 草稿失败时保留警示和原始损坏代，禁止制造不可恢复的新会话。
+            status = "会话归档重建失败，损坏数据仍保留在 \(sessionStore.storageDirectoryURL.path)：草稿保存失败"
+            // 明确返回失败供测试和后续生命周期保护使用。
+            return false
+        }
+        do {
+            // 原子归档双代后用当前内存标签身份、顺序和活动 UUID 建立新 current。
+            let result = try sessionStore.archiveCorruptedGenerationsAndReset(
+                to: currentSessionState,
+                date: date,
+                identifier: identifier
+            )
+            // 只有归档与新会话都成功后才关闭持续警示。
+            hasUnrecoverableSessionFailure = false
+            // 保留本次精确归档目录供完成提示和 Finder 动作使用。
+            lastSessionArchiveURL = result.directoryURL
+            // 把归档目录写入状态栏，便于用户稍后精确找回原始证据。
+            status = "损坏会话已归档并重建：\(result.directoryURL.path)"
+            // 明确返回成功供界面和测试确认闭环。
+            return true
+        } catch {
+            // 任一步失败都保留警示，不把部分操作误报为已经恢复。
+            hasUnrecoverableSessionFailure = true
+            // 同时给出原会话目录和底层原因，保证失败后证据仍可定位。
+            status = "会话归档重建失败，损坏数据仍保留在 \(sessionStore.storageDirectoryURL.path)：\(error.localizedDescription)"
+            // 让调用方继续阻止无提示退出。
+            return false
+        }
+    }
+
     // 判断另存为路径是否会与其他打开标签冲突。
     func canAdoptFileURL(_ rawURL: URL, for document: EditorModel) -> Bool {
         // 非文件 URL 不允许成为本地文档身份。
@@ -484,6 +548,8 @@ final class WorkspaceModel: ObservableObject {
         } catch {
             // 会话 JSON 损坏时回退新标签，不崩溃也不覆盖草稿。
             status = "会话恢复失败，已新建标签：\(error.localizedDescription)"
+            // 发布持续恢复警示，普通状态文案变化也不能隐藏未解决的数据风险。
+            hasUnrecoverableSessionFailure = true
             // 创建安全可编辑状态，但不迁移草稿或保存空会话覆盖损坏证据。
             appendInitialDocument(allowsPersistence: false)
         }
@@ -545,15 +611,10 @@ final class WorkspaceModel: ObservableObject {
     @discardableResult
     private func persistSession() -> Bool {
         do {
-            // 只保存身份和路径，正文继续由独立草稿管理。
-            let state = WorkspaceSessionState(
-                documents: documents.map {
-                    WorkspaceSessionDocument(id: $0.id, fileURL: $0.currentFileURL)
-                },
-                activeDocumentID: activeDocumentID
-            )
             // 原子写入单个会话文件。
-            try sessionStore.save(state)
+            try sessionStore.save(currentSessionState)
+            // 外部人工修复后若普通保存恢复成功，同样关闭已经解决的持续警示。
+            hasUnrecoverableSessionFailure = false
             // 明确返回本轮会话已安全落盘。
             return true
         } catch {
@@ -562,6 +623,17 @@ final class WorkspaceModel: ObservableObject {
             // 让退出保护阻止无提示丢失标签顺序。
             return false
         }
+    }
+
+    // 从当前内存标签构建唯一会话描述，供普通保存和归档重建共享。
+    private var currentSessionState: WorkspaceSessionState {
+        // 只保存身份和路径，正文继续由独立草稿管理。
+        WorkspaceSessionState(
+            documents: documents.map {
+                WorkspaceSessionDocument(id: $0.id, fileURL: $0.currentFileURL)
+            },
+            activeDocumentID: activeDocumentID
+        )
     }
 
     // 刷新仍存在于磁盘的最近文件。

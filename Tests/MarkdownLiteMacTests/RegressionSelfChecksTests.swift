@@ -63,6 +63,13 @@ struct RegressionSelfChecksTests {
                 documentStatus: "已从上一代草稿恢复"
             ) == "已从上一代会话恢复 1 个标签；已从上一代草稿恢复"
         )
+        // 归档成功已有独立 Finder 入口，状态栏继续展示最新文档反馈。
+        #expect(
+            WorkspaceStatusPresentation.visibleStatus(
+                workspaceStatus: "损坏会话已归档并重建：/tmp/RecoveryArchives/example",
+                documentStatus: "已自动保存草稿"
+            ) == "已自动保存草稿"
+        )
         // 普通会话状态不抢占当前标签反馈。
         #expect(
             WorkspaceStatusPresentation.visibleStatus(

@@ -288,6 +288,8 @@ struct WorkspaceModelReliabilityTests {
         #expect(workspace.documents.count == 1)
         // 工作区状态必须明确提示会话恢复失败。
         #expect(workspace.status.hasPrefix("会话恢复失败，已新建标签"))
+        // 独立发布状态必须持续驱动恢复警示，不能依赖易变化的文案判断。
+        #expect(workspace.hasUnrecoverableSessionFailure)
         // current 损坏现场不得被空会话覆盖。
         #expect(try Data(contentsOf: currentURL) == currentEvidence)
         // previous 损坏现场也必须逐字节保留。
@@ -304,6 +306,8 @@ struct WorkspaceModelReliabilityTests {
         #expect(!workspace.flushDraftsAndSession())
         // flush 之后全局失败状态仍必须可见。
         #expect(workspace.status.hasPrefix("会话保存失败"))
+        // 普通持久化失败不能误清除尚未归档的恢复警示。
+        #expect(workspace.hasUnrecoverableSessionFailure)
     }
 
     // current 缺失且唯一 previous 损坏时，工作区任何保存都必须保留证据并阻止退出。
@@ -359,6 +363,8 @@ struct WorkspaceModelReliabilityTests {
         #expect(workspace.documents.count == 1)
         // 初始化必须明确提示会话恢复失败。
         #expect(workspace.status.hasPrefix("会话恢复失败，已新建标签"))
+        // 仅剩损坏 previous 同样属于需要用户处理的不可恢复状态。
+        #expect(workspace.hasUnrecoverableSessionFailure)
         // 初始化不能补写新 current。
         #expect(!FileManager.default.fileExists(atPath: currentURL.path))
         // previous 原始证据必须保持不变。
@@ -376,6 +382,236 @@ struct WorkspaceModelReliabilityTests {
         #expect(!workspace.flushDraftsAndSession())
         // flush 后不能改变 previous 证据。
         #expect(try Data(contentsOf: previousURL) == previousEvidence)
+        // 多次失败后持续警示仍不能被关闭。
+        #expect(workspace.hasUnrecoverableSessionFailure)
+    }
+
+    // 双代损坏完成归档和当前内存状态重建后，持续警示才可以关闭。
+    @Test("双代损坏归档重建后关闭持续警示")
+    @MainActor
+    func testArchiveAndRebuildClearsUnrecoverableSessionFailure() throws {
+        // 创建本次成功闭环独享目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 建立双代损坏现场并走正式工作区恢复入口。
+        let fixture = try makeDoubleCorruptWorkspace(at: root)
+        // 测试结束前停止内存标签的延迟任务。
+        defer { fixture.workspace.documents.forEach { $0.prepareForClose() } }
+        // 使用固定日期让归档目录可精确核对。
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        // 使用固定 UUID 防止同毫秒目录名不确定。
+        let identifier = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
+        // 保存重建前当前内存标签的身份和活动状态。
+        let expectedState = WorkspaceSessionState(
+            documents: fixture.workspace.documents.map {
+                WorkspaceSessionDocument(id: $0.id, fileURL: $0.currentFileURL)
+            },
+            activeDocumentID: fixture.workspace.activeDocumentID
+        )
+        // 按存储契约构造确定归档目录。
+        let archiveDirectory =
+            root
+            .appendingPathComponent("RecoveryArchives", isDirectory: true)
+            .appendingPathComponent(
+                "WorkspaceSession-1700000000000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                isDirectory: true
+            )
+
+        // 正式模型入口先保护草稿，再归档双代并重建 current。
+        #expect(fixture.workspace.archiveCorruptedSessionAndRebuild(date: date, identifier: identifier))
+
+        // 完整成功后持续警示必须关闭。
+        #expect(!fixture.workspace.hasUnrecoverableSessionFailure)
+        // 最近归档目录必须保持可达，供完成提示继续打开 Finder。
+        #expect(fixture.workspace.lastSessionArchiveURL == archiveDirectory)
+        // 状态反馈必须包含可供人工定位的归档目录。
+        #expect(fixture.workspace.status == "损坏会话已归档并重建：\(archiveDirectory.path)")
+        // 新 current 必须准确采用当时内存标签顺序和活动 UUID。
+        #expect(try fixture.sessionStore.load() == expectedState)
+        // 原 current 字节必须保存在归档中的同名文件。
+        #expect(
+            try Data(
+                contentsOf: archiveDirectory.appendingPathComponent("WorkspaceSession.json")
+            ) == fixture.currentEvidence
+        )
+        // 原 previous 字节也必须完整进入同一归档目录。
+        #expect(
+            try Data(
+                contentsOf: archiveDirectory.appendingPathComponent("WorkspaceSession.previous.json")
+            ) == fixture.previousEvidence
+        )
+        // 原 previous 槽位暂时保留，避免归档校验到删除之间覆盖外部更新。
+        #expect(
+            try Data(
+                contentsOf: root.appendingPathComponent("WorkspaceSession.previous.json")
+            ) == fixture.previousEvidence
+        )
+    }
+
+    // 归档目标发生碰撞时必须保留警示、错误证据和既有归档内容。
+    @Test("归档重建失败时保留状态与原始证据")
+    @MainActor
+    func testArchiveFailureKeepsUnrecoverableSessionState() throws {
+        // 创建本次失败闭环独享目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 建立双代损坏现场并走正式工作区恢复入口。
+        let fixture = try makeDoubleCorruptWorkspace(at: root)
+        // 测试结束前停止内存标签的延迟任务。
+        defer { fixture.workspace.documents.forEach { $0.prepareForClose() } }
+        // 固定日期和 UUID 用于预先占据精确归档目标。
+        let date = Date(timeIntervalSince1970: 1_700_000_001)
+        // 固定标识确保生产方法命中同名目录拒绝覆盖。
+        let identifier = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+        // 按生产命名规则构造碰撞目录。
+        let archiveDirectory =
+            root
+            .appendingPathComponent("RecoveryArchives", isDirectory: true)
+            .appendingPathComponent(
+                "WorkspaceSession-1700000001000-11111111-2222-3333-4444-555555555555",
+                isDirectory: true
+            )
+        // 预先创建目录以模拟已有恢复归档。
+        try FileManager.default.createDirectory(at: archiveDirectory, withIntermediateDirectories: true)
+        // 写入标记文件，证明失败路径不会覆盖既有归档。
+        let markerURL = archiveDirectory.appendingPathComponent("保留.txt", isDirectory: false)
+        // 使用可精确读回的固定标记字节。
+        let markerData = Data("既有归档".utf8)
+        // 在调用模型入口前保存标记。
+        try markerData.write(to: markerURL, options: [.atomic])
+
+        // 同名归档必须失败而不是覆盖既有证据。
+        #expect(!fixture.workspace.archiveCorruptedSessionAndRebuild(date: date, identifier: identifier))
+
+        // 任一步失败后持续警示必须保持打开。
+        #expect(fixture.workspace.hasUnrecoverableSessionFailure)
+        // 失败不能发布一个并未完成的新归档结果。
+        #expect(fixture.workspace.lastSessionArchiveURL == nil)
+        // 状态必须明确重建失败并给出原始会话目录。
+        #expect(fixture.workspace.status.hasPrefix("会话归档重建失败，损坏数据仍保留在 \(root.path)"))
+        // current 损坏字节必须逐字节保持不变。
+        #expect(try Data(contentsOf: fixture.currentURL) == fixture.currentEvidence)
+        // previous 损坏字节也不能因失败而移动或覆盖。
+        #expect(try Data(contentsOf: fixture.previousURL) == fixture.previousEvidence)
+        // 既有归档标记必须保持原样。
+        #expect(try Data(contentsOf: markerURL) == markerData)
+    }
+
+    // 成功重建后后续标签变化和草稿仍必须正常保存并可跨启动恢复。
+    @Test("归档重建后可继续持久化标签和草稿")
+    @MainActor
+    func testPersistenceContinuesAfterArchiveRebuild() throws {
+        // 创建本次跨启动验证独享目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理这个精确目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 建立双代损坏现场并走正式工作区恢复入口。
+        let fixture = try makeDoubleCorruptWorkspace(at: root)
+        // 使用独立固定标识完成第一次安全重建。
+        let identifier = UUID(uuidString: "99999999-8888-7777-6666-555555555555")!
+        // 重建必须成功后才继续验证普通持久化路径。
+        #expect(
+            fixture.workspace.archiveCorruptedSessionAndRebuild(
+                date: Date(timeIntervalSince1970: 1_700_000_002),
+                identifier: identifier
+            )
+        )
+        // 新建第二个标签会立即走普通 persistSession 并轮换有效 current。
+        fixture.workspace.newDocument()
+        // 取得重建后的新活动标签。
+        let addedDocument = try #require(fixture.workspace.activeDocument)
+        // 修改正文，验证新的 UUID 草稿也能正常写入。
+        addedDocument.text = "重建后新增正文"
+        // 退出保护必须同时保存全部草稿和最新会话。
+        #expect(fixture.workspace.flushDraftsAndSession())
+        // 保存预期标签顺序供跨启动核对。
+        let expectedOrder = fixture.workspace.documents.map(\.id)
+        // 保存预期活动 UUID，证明普通持久化没有退回旧状态。
+        let expectedActiveID = fixture.workspace.activeDocumentID
+        // 停止原工作区任务，模拟进程退出后的静止磁盘状态。
+        fixture.workspace.documents.forEach { $0.prepareForClose() }
+
+        // 使用相同存储创建新工作区，走完整会话和草稿恢复链。
+        let restoredWorkspace = WorkspaceModel(
+            documentStore: DocumentSupportStore(rootDirectory: root),
+            sessionStore: WorkspaceSessionStore(rootDirectory: root),
+            restoresSession: true
+        )
+        // 测试结束前停止新工作区全部延迟任务。
+        defer { restoredWorkspace.documents.forEach { $0.prepareForClose() } }
+        // 重启后标签身份和顺序必须与重建后最新状态一致。
+        #expect(restoredWorkspace.documents.map(\.id) == expectedOrder)
+        // 活动标签必须恢复为后来新增的标签。
+        #expect(restoredWorkspace.activeDocumentID == expectedActiveID)
+        // 新增标签草稿正文必须可通过同一 UUID 恢复。
+        #expect(restoredWorkspace.activeDocument?.text == "重建后新增正文")
+        // 有效新会话不应再次触发不可恢复警示。
+        #expect(!restoredWorkspace.hasUnrecoverableSessionFailure)
+    }
+
+    // 在隔离目录建立两份不同损坏字节，并返回正式初始化后的工作区夹具。
+    @MainActor
+    private func makeDoubleCorruptWorkspace(at root: URL) throws -> (
+        workspace: WorkspaceModel,
+        sessionStore: WorkspaceSessionStore,
+        currentURL: URL,
+        previousURL: URL,
+        currentEvidence: Data,
+        previousEvidence: Data
+    ) {
+        // 文档支撑层与会话层共享隔离产品目录。
+        let documentStore = DocumentSupportStore(rootDirectory: root)
+        // 会话存储用于建立双代并供测试读回。
+        let sessionStore = WorkspaceSessionStore(rootDirectory: root)
+        // 第一份有效状态将在下一次保存后成为 previous。
+        let firstID = UUID()
+        // 第二份有效状态建立需要随后破坏的 current。
+        let secondID = UUID()
+        // 首次保存建立单一 current。
+        try sessionStore.save(
+            WorkspaceSessionState(
+                documents: [WorkspaceSessionDocument(id: firstID, fileURL: nil)],
+                activeDocumentID: firstID
+            )
+        )
+        // 第二次保存完成 current 和 previous 双代布局。
+        try sessionStore.save(
+            WorkspaceSessionState(
+                documents: [WorkspaceSessionDocument(id: secondID, fileURL: nil)],
+                activeDocumentID: secondID
+            )
+        )
+        // 定位生产 current 固定路径。
+        let currentURL = root.appendingPathComponent("WorkspaceSession.json", isDirectory: false)
+        // 定位生产 previous 固定路径。
+        let previousURL = root.appendingPathComponent("WorkspaceSession.previous.json", isDirectory: false)
+        // current 使用独立可核对损坏字节。
+        let currentEvidence = Data("{workspace-current-corrupt".utf8)
+        // previous 使用不同字节证明归档没有混淆代次。
+        let previousEvidence = Data("{workspace-previous-corrupt".utf8)
+        // 原子覆盖 current 制造不可解码现场。
+        try currentEvidence.write(to: currentURL, options: [.atomic])
+        // 原子覆盖 previous 迫使加载完全失败。
+        try previousEvidence.write(to: previousURL, options: [.atomic])
+        // 使用正式恢复入口创建仍可编辑的纯内存工作区。
+        let workspace = WorkspaceModel(
+            documentStore: documentStore,
+            sessionStore: sessionStore,
+            restoresSession: true
+        )
+        // 夹具必须确实进入不可恢复状态，否则后续断言没有意义。
+        #expect(workspace.hasUnrecoverableSessionFailure)
+        // 返回测试需要的模型、存储、路径和原始证据。
+        return (
+            workspace,
+            sessionStore,
+            currentURL,
+            previousURL,
+            currentEvidence,
+            previousEvidence
+        )
     }
 
     // 为每个测试创建唯一目录，避免并行执行时互相覆盖。

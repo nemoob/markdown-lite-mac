@@ -24,6 +24,50 @@ struct WorkspaceSessionLoadResult: Equatable {
     let recoveredFromPrevious: Bool
 }
 
+// 返回一次损坏会话归档的确定目录和逐代文件地址。
+struct WorkspaceSessionArchiveResult: Equatable {
+    // 每次归档使用独立目录，避免覆盖之前保留的恢复证据。
+    let directoryURL: URL
+    // 文件顺序与 current、previous 的检查顺序一致。
+    let archivedFileURLs: [URL]
+}
+
+// 汇总归档重建入口可以稳定区分的安全拒绝原因。
+enum WorkspaceSessionArchiveError: LocalizedError, Equatable {
+    // 没有任何会话代时不能伪造一次损坏恢复。
+    case noGenerations
+    // 任一代仍可恢复时必须继续使用现有正常恢复路径。
+    case recoverableGenerationExists
+    // 调用方复用了相同日期和标识时不能覆盖既有归档。
+    case archiveDestinationAlreadyExists
+    // 归档副本与原始字节不一致时不能清理原槽位。
+    case archiveVerificationFailed
+    // 安装新 current 后路径又发生变化时不能用旧快照覆盖新字节。
+    case generationsChangedDuringArchive
+
+    // 返回不暴露正文或完整本机路径的可操作说明。
+    var errorDescription: String? {
+        // 按失败阶段提供稳定中文反馈。
+        switch self {
+        case .noGenerations:
+            // 首次启动没有损坏证据，不需要归档重建。
+            return "没有需要归档的会话恢复文件"
+        case .recoverableGenerationExists:
+            // 有效会话必须通过正常加载使用，不能被恢复操作移走。
+            return "仍有可恢复的会话，已拒绝归档重建"
+        case .archiveDestinationAlreadyExists:
+            // 归档目录碰撞时要求调用方使用新标识重试。
+            return "会话归档目录已存在，请使用新的恢复标识重试"
+        case .archiveVerificationFailed:
+            // 校验失败时原会话槽位保持不变。
+            return "会话归档校验失败，原始恢复文件仍保留"
+        case .generationsChangedDuringArchive:
+            // Finder 或其他工具更新了 current 时保留新字节并要求用户重新检查。
+            return "归档期间当前会话文件发生变化，未覆盖外部更新，请重新检查后再试"
+        }
+    }
+}
+
 // 用当前和上一代两个原子 JSON 文件管理工作区会话。
 final class WorkspaceSessionStore {
     // 与文档草稿共用产品目录但使用独立文件。
@@ -32,6 +76,8 @@ final class WorkspaceSessionStore {
     private static let sessionFilename = "WorkspaceSession.json"
     // 上一代文件在当前文件损坏或缺失时提供一次回退。
     private static let previousSessionFilename = "WorkspaceSession.previous.json"
+    // 损坏会话归档集中放在产品目录下，便于后续 Finder 入口定位。
+    private static let archiveFolderName = "RecoveryArchives"
 
     // 保留注入的文件管理器，便于隔离自检。
     private let fileManager: FileManager
@@ -54,6 +100,21 @@ final class WorkspaceSessionStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         // 创建配套解码器。
         decoder = JSONDecoder()
+    }
+
+    // 暴露实际存储目录供恢复界面打开 Finder，不允许调用方修改内部路径。
+    var storageDirectoryURL: URL {
+        // 返回初始化时已经确定的产品目录。
+        rootDirectory
+    }
+
+    // 返回当前真实存在的会话代，顺序固定为 current、previous。
+    var existingGenerationURLs: [URL] {
+        // 固定候选顺序让归档结果和测试都可预测。
+        [sessionFileURL, previousSessionFileURL].filter {
+            // 只返回磁盘上仍存在的精确槽位。
+            fileManager.fileExists(atPath: $0.path)
+        }
     }
 
     // 原子保存完整标签顺序和活动标签。
@@ -130,6 +191,192 @@ final class WorkspaceSessionStore {
         return nil
     }
 
+    // 归档全部不可恢复的现有代，并用调用方当前内存状态安装有效 current。
+    func archiveCorruptedGenerationsAndReset(
+        to state: WorkspaceSessionState,
+        date: Date = Date(),
+        identifier: UUID = UUID()
+    ) throws -> WorkspaceSessionArchiveResult {
+        // 读取一次固定顺序快照，后续操作不能因文件变化跳过某一代。
+        let generationURLs = existingGenerationURLs
+        // 两代都不存在属于首次启动，不能执行破坏性恢复动作。
+        guard !generationURLs.isEmpty else {
+            // 使用稳定错误让 UI 保持普通首次启动流程。
+            throw WorkspaceSessionArchiveError.noGenerations
+        }
+        // 一次读入每个现有代的原始字节，归档和有效性判断必须使用同一份快照。
+        let originalGenerations = try generationURLs.map { generationURL in
+            // 原始 Data 必须在创建归档前完整读取成功。
+            (url: generationURL, data: try Data(contentsOf: generationURL))
+        }
+        // 任一快照可完整解码时必须拒绝归档，继续使用既有安全回退。
+        for original in originalGenerations
+        where (try? decoder.decode(WorkspaceSessionState.self, from: original.data)) != nil {
+            // 不允许把仍可恢复的用户会话移入故障归档。
+            throw WorkspaceSessionArchiveError.recoverableGenerationExists
+        }
+
+        // 在触碰任何原文件前完成新会话编码，排除编码失败造成的半归档状态。
+        let replacementData = try encoder.encode(state)
+        // 立即回读编码结果，确保随后写入的数据可恢复成完全相同的状态。
+        guard try decoder.decode(WorkspaceSessionState.self, from: replacementData) == state else {
+            // 理论异常仍按归档验证失败保守停止。
+            throw WorkspaceSessionArchiveError.archiveVerificationFailed
+        }
+        // 日期与调用方标识共同生成不会覆盖历史的确定目录名。
+        let archiveDirectory = archiveDirectoryURL(date: date, identifier: identifier)
+        // 既有同名目录可能包含上次证据，绝不能复用或覆盖。
+        guard !fileManager.fileExists(atPath: archiveDirectory.path) else {
+            // 调用方可以更换默认随机标识后安全重试。
+            throw WorkspaceSessionArchiveError.archiveDestinationAlreadyExists
+        }
+
+        // 记录已经逐字节验证的归档文件，成功结果按相同顺序返回。
+        var archivedFileURLs: [URL] = []
+        do {
+            // 创建本次独立目录及缺失的 RecoveryArchives 父目录。
+            try fileManager.createDirectory(at: archiveDirectory, withIntermediateDirectories: true)
+            // 每一代先复制到归档并回读验证，验证完成前不删除原槽位。
+            for original in originalGenerations {
+                // 保留正式文件名，便于人工区分 current 与 previous。
+                let archivedURL = archiveDirectory.appendingPathComponent(
+                    original.url.lastPathComponent,
+                    isDirectory: false
+                )
+                // 原子写入归档副本，失败不会留下半个目标文件。
+                try original.data.write(to: archivedURL, options: [.atomic])
+                // 回读归档字节，不能只依赖 write 没有抛错。
+                let archivedData = try Data(contentsOf: archivedURL)
+                // 任一字节不一致都停止在原槽位尚未变化的阶段。
+                guard archivedData == original.data else {
+                    // 抛出稳定校验错误并进入下方清理部分目录。
+                    throw WorkspaceSessionArchiveError.archiveVerificationFailed
+                }
+                // 本代验证成功后加入最终结果。
+                archivedFileURLs.append(archivedURL)
+            }
+        } catch {
+            // 原槽位尚未触碰，可尽力移除本次不完整归档目录避免混淆。
+            try? fileManager.removeItem(at: archiveDirectory)
+            // 保留原始失败原因供调用方反馈。
+            throw error
+        }
+
+        // 先在归档中永久保留本次拟重建状态，外部后写 current 时仍可人工找回。
+        let rebuiltSessionURL = archiveDirectory.appendingPathComponent(
+            "WorkspaceSession.rebuilt.json",
+            isDirectory: false
+        )
+        // 独立原子副本不与正式 current 共享 inode，外部原地写入也不会污染它。
+        try replacementData.write(to: rebuiltSessionURL, options: [.atomic])
+        // 回读确认归档中的重建状态逐字节完整。
+        guard try Data(contentsOf: rebuiltSessionURL) == replacementData else {
+            // 永久副本不完整时不能继续安装正式 current。
+            throw WorkspaceSessionArchiveError.archiveVerificationFailed
+        }
+        // 再创建供系统原子安装消费的同卷临时副本。
+        let replacementURL = archiveDirectory.appendingPathComponent(
+            "WorkspaceSession.replacement.json",
+            isDirectory: false
+        )
+        // 原子写保证待安装文件本身不会是半份 JSON，也不复用永久副本 inode。
+        try replacementData.write(to: replacementURL, options: [.atomic])
+        // 记录调用开始时是否存在 current，决定采用原子替换还是无覆盖硬链接。
+        if let currentOriginal = originalGenerations.first(where: {
+            // 精确比较固定 current 地址，不能按数组位置猜测。
+            $0.url == sessionFileURL
+        }) {
+            // 唯一备份名位于会话根目录，replaceItemAt 会原子保留提交瞬间的旧 current。
+            let displacedFilename =
+                "WorkspaceSession.replaced-\(identifier.uuidString.lowercased()).json"
+            // 计算 replaceItemAt 成功后应留下的精确备份地址。
+            let displacedURL = rootDirectory.appendingPathComponent(
+                displacedFilename,
+                isDirectory: false
+            )
+            // 既有同名备份可能属于中断恢复，绝不能覆盖。
+            guard !fileManager.fileExists(atPath: displacedURL.path) else {
+                // 与归档目录碰撞使用同一安全拒绝语义。
+                throw WorkspaceSessionArchiveError.archiveDestinationAlreadyExists
+            }
+            // 原子替换让 current 始终存在，并把提交瞬间被替换的精确字节放到备份路径。
+            _ = try fileManager.replaceItemAt(
+                sessionFileURL,
+                withItemAt: replacementURL,
+                backupItemName: displacedFilename,
+                options: [.withoutDeletingBackupItem]
+            )
+            // 读取精确被替换的 current，不能假定它仍等于调用开始时的快照。
+            let displacedData = try Data(contentsOf: displacedURL)
+            // 提交前若有外部更新，必须把这份额外字节也移入本次归档。
+            if displacedData != currentOriginal.data {
+                // 使用独立文件名同时保留初始快照和提交瞬间的外部更新。
+                let changedArchiveURL = archiveDirectory.appendingPathComponent(
+                    "WorkspaceSession.changed-during-archive.json",
+                    isDirectory: false
+                )
+                // 同卷移动不会复制或覆盖字节，目标在唯一归档目录内必定不存在。
+                try fileManager.moveItem(at: displacedURL, to: changedArchiveURL)
+                // 回读移动后的文件，确认额外证据仍逐字节完整。
+                guard try Data(contentsOf: changedArchiveURL) == displacedData else {
+                    // 任何不一致都保持归档目录并显式失败。
+                    throw WorkspaceSessionArchiveError.archiveVerificationFailed
+                }
+                // 结果中加入额外变化代，Finder 和测试都能精确定位。
+                archivedFileURLs.append(changedArchiveURL)
+            } else {
+                // 初始快照已经完整归档，相同备份只是冗余副本。
+                try? fileManager.removeItem(at: displacedURL)
+            }
+        } else {
+            // current 原本缺失时以硬链接原子创建，若外部刚创建同名文件则绝不覆盖。
+            try fileManager.linkItem(at: replacementURL, to: sessionFileURL)
+            // current 已拥有同一完整 inode 后，归档内的替代链接只是冗余副本。
+            try? fileManager.removeItem(at: replacementURL)
+        }
+
+        // 精确比较正式 current 与本事务字节，外部后写时绝不进行破坏性回滚。
+        guard try Data(contentsOf: sessionFileURL) == replacementData else {
+            // 初始和提交瞬间的证据都已归档，保留外部 current 并要求重新检查。
+            throw WorkspaceSessionArchiveError.generationsChangedDuringArchive
+        }
+        // 再走正式解码路径，确认下次启动能恢复成调用方的完整状态。
+        guard try loadSession(at: sessionFileURL) == state else {
+            // 字节相同却无法恢复属于稳定归档校验失败。
+            throw WorkspaceSessionArchiveError.archiveVerificationFailed
+        }
+
+        // previous 不参与清理，避免任何校验到删除之间的竞态和双槽为空窗口。
+        if let previousOriginal = originalGenerations.first(where: {
+            // 精确匹配 previous，只有调用开始时存在才检查后续外部变化。
+            $0.url == previousSessionFileURL
+        }),
+            let latestPreviousData = try? Data(contentsOf: previousSessionFileURL),
+            latestPreviousData != previousOriginal.data
+        {
+            // 变化的 previous 使用独立名称追加归档，不修改仍在原槽位的新字节。
+            let changedPreviousArchiveURL = archiveDirectory.appendingPathComponent(
+                "WorkspaceSession.previous.changed-during-archive.json",
+                isDirectory: false
+            )
+            // 原子复制最新可读快照，失败时原 previous 仍保持不变。
+            try latestPreviousData.write(to: changedPreviousArchiveURL, options: [.atomic])
+            // 回读确认额外 previous 证据完整。
+            guard try Data(contentsOf: changedPreviousArchiveURL) == latestPreviousData else {
+                // 归档不完整时保留原槽位并显式失败。
+                throw WorkspaceSessionArchiveError.archiveVerificationFailed
+            }
+            // 成功结果包含这份并发变化的 previous。
+            archivedFileURLs.append(changedPreviousArchiveURL)
+        }
+
+        // 成功结果提供目录和每一代的精确归档地址。
+        return WorkspaceSessionArchiveResult(
+            directoryURL: archiveDirectory,
+            archivedFileURLs: archivedFileURLs
+        )
+    }
+
     // 检查当前代损坏后是否仍有可用于恢复的上一代。
     private func hasValidPreviousSession() throws -> Bool {
         // 上一代不存在时由保存调用方保留当前损坏证据并失败。
@@ -148,6 +395,19 @@ final class WorkspaceSessionStore {
         return try decoder.decode(WorkspaceSessionState.self, from: data)
     }
 
+    // 计算一次确定归档目录，调用方 UUID 保证相同时间也不会碰撞。
+    private func archiveDirectoryURL(date: Date, identifier: UUID) -> URL {
+        // 毫秒时间便于按创建顺序查看，同时避免文件名包含冒号。
+        let timestamp = Int64((date.timeIntervalSince1970 * 1_000).rounded(.down))
+        // UUID 统一小写，保证测试和跨启动结果稳定。
+        let directoryName = "WorkspaceSession-\(timestamp)-\(identifier.uuidString.lowercased())"
+        // 所有会话故障归档集中在固定父目录下。
+        return
+            rootDirectory
+            .appendingPathComponent(Self.archiveFolderName, isDirectory: true)
+            .appendingPathComponent(directoryName, isDirectory: true)
+    }
+
     // 计算固定会话文件地址。
     private var sessionFileURL: URL {
         // 会话文件不与 Drafts 子目录混放。
@@ -161,7 +421,7 @@ final class WorkspaceSessionStore {
     }
 
     // 获取与文档支撑层一致的默认产品目录。
-    private static func defaultRootDirectory(fileManager: FileManager) -> URL {
+    static func defaultRootDirectory(fileManager: FileManager) -> URL {
         // 优先使用系统用户级 Application Support。
         let applicationSupport = fileManager.urls(
             for: .applicationSupportDirectory,
