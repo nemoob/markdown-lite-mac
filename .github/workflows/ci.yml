@@ -40,8 +40,15 @@ jobs:
 
       - name: Validate packaged application
         run: |
+          source_version="$(plutil -extract CFBundleShortVersionString raw -o - Support/Info.plist)"
+          source_build="$(plutil -extract CFBundleVersion raw -o - Support/Info.plist)"
+          [[ "$source_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$source_build" =~ ^[0-9]+$ ]]
           test -x dist/MarkdownLiteMac.app/Contents/MacOS/MarkdownLiteMac
           plutil -lint dist/MarkdownLiteMac.app/Contents/Info.plist
-          test "$(plutil -extract CFBundleShortVersionString raw -o - dist/MarkdownLiteMac.app/Contents/Info.plist)" = "0.6.0"
-          test "$(plutil -extract CFBundleVersion raw -o - dist/MarkdownLiteMac.app/Contents/Info.plist)" = "6"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - dist/MarkdownLiteMac.app/Contents/Info.plist)" = "$source_version"
+          test "$(plutil -extract CFBundleVersion raw -o - dist/MarkdownLiteMac.app/Contents/Info.plist)" = "$source_build"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            test "$GITHUB_REF_NAME" = "v$source_version"
+          fi
           codesign --verify --deep --strict dist/MarkdownLiteMac.app

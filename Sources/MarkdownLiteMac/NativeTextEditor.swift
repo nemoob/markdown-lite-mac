@@ -175,12 +175,57 @@ enum NativeEditorActions {
     }
 }
 
-// 拦截图片文件和剪贴板位图，同时保留 NSTextView 其他原生粘贴行为。
-private final class MarkdownNativeTextView: NSTextView {
+// 拦截 Markdown 高频编辑动作，同时保留 NSTextView 其他原生行为。
+final class MarkdownNativeTextView: NSTextView {
     // 文件型图片交给当前文档资源层处理并返回 Markdown。
     var importImageFile: ((URL) -> String?)?
     // 位图型剪贴板内容交给资源层落盘并返回 Markdown。
     var importImageData: ((Data, String) -> String?)?
+
+    // 在原生回车入口只续写明确的 Markdown 列表，其他输入完全交还系统。
+    override func insertNewline(_ sender: Any?) {
+        // 输入法组合期由 NSTextView 和当前输入法共同决定回车语义。
+        guard !hasMarkedText() else {
+            // 不拦截候选确认，避免中文、日文等组合输入被误改为列表换行。
+            super.insertNewline(sender)
+            // 原生输入已完成本次动作。
+            return
+        }
+        // 纯逻辑编辑计划只接受一个明确光标，不猜测多选区的执行顺序。
+        guard selectedRanges.count == 1 else {
+            // 多光标或异常无选区时保留 AppKit 原本的替换行为。
+            super.insertNewline(sender)
+            // 原生输入已完成本次动作。
+            return
+        }
+        // NSTextView 选区和 helper 统一使用 UTF-16 坐标。
+        let selection = selectedRange()
+        // 非折叠选区回车应使用系统的选中文本替换语义。
+        guard selection.location != NSNotFound, selection.length == 0 else {
+            // 不在自定义路径重建 AppKit 已有的选区处理。
+            super.insertNewline(sender)
+            // 原生输入已完成本次动作。
+            return
+        }
+        // 直接借用 NSTextStorage 的原生可变字符串，避免 Return 前复制整篇正文。
+        guard let nativeContent = textStorage?.mutableString,
+            // 纯 helper 同步只读正文并返回一次最小替换计划。
+            let edit = MarkdownListContinuationSupport.edit(in: nativeContent, selection: selection)
+        else {
+            // 普通段落、代码块或不受支持的边界继续使用原生回车。
+            super.insertNewline(sender)
+            // 原生输入已完成本次动作。
+            return
+        }
+        // 先结束连续打字合并，让智能回车可以被单独撤销。
+        breakUndoCoalescing()
+        // 只调用一次原生输入入口，同时保留 delegate 回写和撤销注册。
+        insertText(edit.replacement, replacementRange: edit.replacementRange)
+        // 按纯计划恢复精确光标，空项退出和新项续写共用同一路径。
+        setSelectedRange(edit.selectionAfterEdit)
+        // 再次结束合并，后续正文输入不会与本次回车共同撤销。
+        breakUndoCoalescing()
+    }
 
     // 粘贴时优先识别图片，普通文字仍走系统行为。
     override func paste(_ sender: Any?) {

@@ -9,6 +9,8 @@ private func runSelfCheck() {
         let documentReport = try DocumentSupportSelfCheck.run()
         // Markdown 层严格执行 200KB 和 1MB 性能目标。
         let markdownReport = EnhancedMarkdownSelfCheck.run()
+        // 智能列表层用 1MB 文档严格执行 Return 延迟目标。
+        let listContinuationReport = MarkdownListContinuationSelfCheck.run()
         // 会话层验证标签顺序和活动标签可跨启动恢复。
         let sessionReport = try SessionSupportSelfCheck.run()
         // 图片层验证相对路径、重名、类型和目录安全。
@@ -31,6 +33,12 @@ private func runSelfCheck() {
         print(
             "Markdown 性能通过：200KB \(String(format: "%.2f", markdownReport.mediumDocument.milliseconds))ms，"
                 + "1MB \(String(format: "%.2f", markdownReport.largeDocument.milliseconds))ms"
+        )
+        // 输出智能 Return 的尾延迟和最大值，方便 CI 与发布复核。
+        print(
+            "智能列表 Return 性能通过：1MB p95 "
+                + "\(String(format: "%.2f", listContinuationReport.p95Milliseconds))ms，"
+                + "max \(String(format: "%.2f", listContinuationReport.maximumMilliseconds))ms"
         )
         // 输出导出层成功标记。
         print("ExportSupportSelfCheck：通过")
