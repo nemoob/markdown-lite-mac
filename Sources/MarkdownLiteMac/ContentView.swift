@@ -2,6 +2,78 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+// 保存编辑栏格式菜单的一项可测试描述和原生动作路由。
+struct EditorFormattingMenuEntry: Identifiable, Equatable, Sendable {
+    // 稳定标识供 SwiftUI 菜单复用对应项。
+    let id: String
+    // 菜单展示用户可理解的格式名称。
+    let title: String
+    // 快捷键只作为提示展示，实际按键仍由应用命令统一处理。
+    let shortcutHint: String
+    // 帮助文字同时用于 tooltip 和无障碍提示。
+    let helpText: String
+    // 路由复用现有原生格式命令及其撤销路径。
+    let command: MarkdownEditorFormattingCommand
+}
+
+// 集中定义编辑栏格式菜单内容，避免 UI 标题与动作路由漂移。
+enum EditorFormattingMenuContent {
+    // 菜单入口使用明确的无障碍名称。
+    static let accessibilityLabel = "Markdown 格式"
+    // tooltip 简述菜单不会直接改写选区以外的内容。
+    static let helpText = "为选区或当前行应用 Markdown 格式"
+    // 无障碍提示列出菜单覆盖的完整能力。
+    static let accessibilityHint = "打开粗体、斜体、行内代码、链接和一到六级标题格式菜单"
+
+    // 高频行内格式保持在一级菜单，减少日常操作层级。
+    static let inlineEntries: [EditorFormattingMenuEntry] = [
+        // 粗体复用双星号切换命令。
+        .init(
+            id: "bold",
+            title: "粗体",
+            shortcutHint: "⌘B",
+            helpText: "用双星号包裹或取消包裹当前选区",
+            command: .bold
+        ),
+        // 斜体复用单星号切换命令。
+        .init(
+            id: "italic",
+            title: "斜体",
+            shortcutHint: "⌘I",
+            helpText: "用单星号包裹或取消包裹当前选区",
+            command: .italic
+        ),
+        // 行内代码复用反引号切换命令。
+        .init(
+            id: "inline-code",
+            title: "行内代码",
+            shortcutHint: "⌘E",
+            helpText: "用反引号包裹或取消包裹当前选区",
+            command: .inlineCode
+        ),
+        // 链接命令继续使用现有安全占位地址。
+        .init(
+            id: "link",
+            title: "链接",
+            shortcutHint: "⌘K",
+            helpText: "把当前选区转换为 Markdown 链接",
+            command: .link
+        ),
+    ]
+
+    // 六级标题放入子菜单，保持编辑栏和一级菜单紧凑。
+    static let headingEntries: [EditorFormattingMenuEntry] = (1...6).map { level in
+        // 每一级都路由到现有标题转换命令。
+        EditorFormattingMenuEntry(
+            id: "heading-\(level)",
+            title: "H\(level) 标题",
+            shortcutHint: "⌘⌥\(level)",
+            helpText: "把当前行或所选行转换为 \(level) 级标题",
+            command: .heading(level: level)
+        )
+    }
+}
+
 // 组合多文档标签、原生编辑、相对图片、大纲和发布操作。
 struct ContentView: View {
     // 工作区管理标签顺序、活动标签和会话恢复。
@@ -231,6 +303,8 @@ private struct WorkspaceEditorView: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
+                // 紧凑菜单让已有格式能力在编辑区可发现。
+                formattingMenu
                 Button {
                     ImageImportUI.chooseImages(for: document)
                 } label: {
@@ -267,6 +341,65 @@ private struct WorkspaceEditorView: View {
                 }
             }
         }
+    }
+
+    // 用单一入口展示行内格式和六级标题，不占用多枚工具栏按钮。
+    private var formattingMenu: some View {
+        Menu {
+            // 高频行内操作直接展示，并携带可见快捷键提示。
+            ForEach(EditorFormattingMenuContent.inlineEntries) { entry in
+                formattingButton(for: entry)
+            }
+            Divider()
+            // 标题级别放入子菜单，避免一级菜单过长。
+            Menu("标题") {
+                // 一到六级标题全部复用现有转换命令。
+                ForEach(EditorFormattingMenuContent.headingEntries) { entry in
+                    formattingButton(for: entry)
+                }
+            }
+            .accessibilityLabel("标题格式")
+            .accessibilityHint("选择一到六级 Markdown 标题")
+        } label: {
+            // 文字和系统图标共同保证入口清晰可辨。
+            Label("格式", systemImage: "textformat")
+        }
+        // 使用原生无边框菜单样式融入紧凑编辑栏。
+        .menuStyle(.borderlessButton)
+        // 固定内容宽度避免挤压文件和预览区域。
+        .fixedSize()
+        // 与相邻图片和查找动作保持同一字号层级。
+        .font(.caption2)
+        // 鼠标停留时说明菜单用途。
+        .help(EditorFormattingMenuContent.helpText)
+        // VoiceOver 使用比可见短标题更明确的名称。
+        .accessibilityLabel(EditorFormattingMenuContent.accessibilityLabel)
+        // VoiceOver 说明完整可用格式范围。
+        .accessibilityHint(EditorFormattingMenuContent.accessibilityHint)
+    }
+
+    // 把一项菜单描述连接到当前活动文档的现有格式动作。
+    private func formattingButton(for entry: EditorFormattingMenuEntry) -> some View {
+        Button {
+            // 原生编辑器继续负责 UTF-16 选区、撤销和输入焦点。
+            NativeEditorActions.applyFormatting(entry.command, documentID: document.id)
+        } label: {
+            // 两列布局同时呈现动作名称和现有快捷键。
+            HStack {
+                // 左侧展示格式名称。
+                Text(entry.title)
+                Spacer()
+                // 右侧弱化快捷键提示，避免与动作名称争夺视觉焦点。
+                Text(entry.shortcutHint)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        // 每项都提供对应 Markdown 行为说明。
+        .help(entry.helpText)
+        // VoiceOver 直接朗读动作名称。
+        .accessibilityLabel(entry.title)
+        // 无障碍提示同时说明结果和可用快捷键。
+        .accessibilityHint("\(entry.helpText)，快捷键 \(entry.shortcutHint)")
     }
 
     // 预览侧可切换大纲，并接收大纲滚动目标和当前文档图片基址。
@@ -310,6 +443,8 @@ private struct WorkspaceEditorView: View {
                     documentURL: document.currentFileURL,
                     scrollTargetLine: previewTargetLine
                 )
+                // 文档切换时重建预览树，避免远程图片确认状态跨标签复用。
+                .id(document.id)
                 .background(Color(nsColor: .textBackgroundColor))
             }
         }

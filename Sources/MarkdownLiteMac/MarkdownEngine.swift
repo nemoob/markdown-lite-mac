@@ -85,7 +85,7 @@ enum EnhancedMarkdownParser {
         // 仅在必要时统一 Windows 和旧式 Mac 换行，常见输入不产生副本。
         let normalized: String
         // 含回车的文档需要转换为单一换行格式。
-        if markdown.contains("\r") {
+        if markdown.utf8.contains(13) {
             // 先处理 Windows 双字符换行，再处理残余单回车。
             normalized =
                 markdown
@@ -138,7 +138,7 @@ enum EnhancedMarkdownParser {
                     index += 1
                 }
                 // 仅在生成模型时把代码切片合并为独立字符串。
-                let code = codeLines.map(String.init).joined(separator: "\n")
+                let code = codeLines.joined(separator: "\n")
                 // 输出带语言提示的代码块。
                 blocks.append(.init(id: start, kind: .code(language: fence.language, text: code)))
                 // 当前代码块已完整消费。
@@ -211,12 +211,14 @@ enum EnhancedMarkdownParser {
             }
 
             // 连续无序项组成一个列表块。
-            if unorderedContent(line) != nil {
+            if let firstContent = unorderedContent(line) {
                 // 保存列表起始行作为稳定块 ID。
                 let start = index
-                // 收集普通列表项和任务列表项。
-                var items: [EnhancedListItem] = []
-                // 同类无序项保持在同一列表中。
+                // 复用首次识别结果，避免同一首行再次解析和复制正文。
+                var items = [listItem(from: firstContent)]
+                // 首个无序项已经写入结果，继续扫描剩余同类行。
+                index += 1
+                // 后续同类无序项保持在同一列表中。
                 while index < lines.count, let content = unorderedContent(lines[index]) {
                     // 去掉可选任务标记并保存勾选状态。
                     items.append(listItem(from: content))
@@ -235,9 +237,11 @@ enum EnhancedMarkdownParser {
                 let start = index
                 // 原文首个编号用于正确显示非 1 起始列表。
                 let startingNumber = firstItem.number
-                // 收集有序列表中的普通项和任务项。
-                var items: [EnhancedListItem] = []
-                // 同类有序项保持在同一列表中。
+                // 复用首次识别结果，避免同一首行再次解析编号和复制正文。
+                var items = [listItem(from: firstItem.text)]
+                // 首个有序项已经写入结果，继续扫描剩余同类行。
+                index += 1
+                // 后续同类有序项保持在同一列表中。
                 while index < lines.count, let content = orderedContent(lines[index]) {
                     // 去掉可选任务标记并保存勾选状态。
                     items.append(listItem(from: content.text))
@@ -251,12 +255,14 @@ enum EnhancedMarkdownParser {
             }
 
             // 连续引用行组成一个引用块。
-            if quoteContent(line) != nil {
+            if let firstContent = quoteContent(line) {
                 // 保存引用起始行作为稳定块 ID。
                 let start = index
-                // 收集去掉引用标记后的正文。
-                var quoteLines: [String] = []
-                // 连续大于号行属于同一引用块。
+                // 复用首次识别结果，避免同一首行再次解析和复制正文。
+                var quoteLines = [firstContent]
+                // 首个引用行已经写入结果，继续扫描剩余连续引用。
+                index += 1
+                // 后续连续大于号行属于同一引用块。
                 while index < lines.count, let content = quoteContent(lines[index]) {
                     // 保留引用内部换行以维持可读性。
                     quoteLines.append(content)
@@ -271,22 +277,17 @@ enum EnhancedMarkdownParser {
 
             // 剩余连续普通文本合并成一个段落。
             let start = index
-            // 段落通常很短，按小容量预留即可。
-            var paragraphLines: [String] = []
-            // 扫描到空行或下一个明确块起点。
+            // 当前行已经完整通过全部块分类，直接作为段落首行复用。
+            var paragraphLines = [String(line)]
+            // 首行已经写入结果，后续扫描无需再次执行同一组分类函数。
+            index += 1
+            // 从第二行起扫描到空行或下一个明确块起点。
             while index < lines.count, !isBlank(lines[index]),
-                !startsBlock(lines: lines, at: index, allowParagraph: true)
+                !startsBlock(lines: lines, at: index)
             {
                 // 普通行只在形成最终模型时复制。
                 paragraphLines.append(String(lines[index]))
                 // 消费当前段落行。
-                index += 1
-            }
-            // 防御未知语法误判导致未消费任何行。
-            if paragraphLines.isEmpty {
-                // 把当前行作为普通段落保底，确保扫描必然前进。
-                paragraphLines.append(String(lines[index]))
-                // 消费保底段落行。
                 index += 1
             }
             // 软换行按空格合并，符合常用 Markdown 显示行为。
@@ -298,7 +299,7 @@ enum EnhancedMarkdownParser {
     }
 
     // 判断段落扫描是否遇到新的明确块起点。
-    private static func startsBlock(lines: [Substring], at index: Int, allowParagraph: Bool) -> Bool {
+    private static func startsBlock(lines: [Substring], at index: Int) -> Bool {
         // 当前调用只处理有效行号。
         let line = lines[index]
         // 空行始终结束当前段落。
@@ -323,8 +324,8 @@ enum EnhancedMarkdownParser {
             // 返回明确块边界。
             return true
         }
-        // 首个普通行属于当前段落，调用方可显式允许它。
-        return !allowParagraph
+        // 普通文本继续归入当前段落。
+        return false
     }
 
     // 判断一行是否只含空格或制表符。
@@ -816,6 +817,53 @@ private struct EnhancedListRow: View {
 
 // 把 Markdown 图片地址解析为可由预览层加载的受控 URL。
 enum EnhancedImageSourceResolver {
+    // 保存一张经过协议和主机校验、但尚未获得用户加载许可的 HTTPS 图片。
+    struct RemoteImageRequest: Equatable {
+        // URL 只有在用户点击当前视图按钮后才可交给 AsyncImage。
+        let url: URL
+        // 界面只展示目标主机，不暴露可能含隐私参数的完整路径和查询串。
+        let displayHost: String
+    }
+
+    // 用纯逻辑区分本地来源、永久阻止的 HTTP 和需要逐图确认的 HTTPS。
+    enum RemoteImageDecision: Equatable {
+        // 没有 HTTP(S) 协议时继续进入本地图片解析。
+        case notRemote
+        // HTTP 或无有效主机的远程地址永不创建网络请求。
+        case blocked
+        // 合法 HTTPS 地址必须等待当前图片视图的明确按钮点击。
+        case requiresConfirmation(RemoteImageRequest)
+    }
+
+    // 在不发起网络请求的前提下判定远程图片加载策略。
+    static func remoteImageDecision(for source: String) -> RemoteImageDecision {
+        // 去掉 Markdown 地址两侧不具 URL 语义的空白。
+        let trimmedSource = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 空地址属于普通无效来源，不进入远程图片分支。
+        guard !trimmedSource.isEmpty else { return .notRemote }
+        // 只有可解析且显式声明协议的地址可能属于远程图片。
+        guard let url = URL(string: trimmedSource), let rawScheme = url.scheme else { return .notRemote }
+        // 协议统一小写以阻止大小写变体绕过策略。
+        let scheme = rawScheme.lowercased()
+        // 明文 HTTP 永久阻止，界面不会提供加载按钮。
+        if scheme == "http" { return .blocked }
+        // 其他协议继续交给本地 file 或非法协议处理逻辑。
+        guard scheme == "https" else { return .notRemote }
+        // HTTPS 必须携带真实目标主机，避免对残缺地址提供误导性确认。
+        guard let rawHost = url.host, !rawHost.isEmpty else { return .blocked }
+        // 主机统一小写，界面不显示路径、查询或用户信息。
+        let normalizedHost = rawHost.lowercased()
+        // 去掉 DNS 可选尾点，避免同一主机呈现两种形式。
+        let displayHost =
+            normalizedHost.hasSuffix(".")
+            ? String(normalizedHost.dropLast())
+            : normalizedHost
+        // 空主机防御性阻止，不能生成没有明确来源的按钮。
+        guard !displayHost.isEmpty else { return .blocked }
+        // 返回仍需当前视图逐图确认的受控请求描述。
+        return .requiresConfirmation(RemoteImageRequest(url: url, displayHost: displayHost))
+    }
+
     // 解析现有 HTTP(S)、file URL 或相对当前文档的本地图片地址。
     static func resolve(_ source: String, documentURL: URL?) -> URL? {
         // 去掉 Markdown 地址两侧不具语义的空白。
@@ -823,13 +871,21 @@ enum EnhancedImageSourceResolver {
         // 空地址不能生成图片请求。
         guard !trimmedSource.isEmpty else { return nil }
 
+        // 先应用远程图片隐私策略，任何远程地址都不能从本地解析接口取得可加载 URL。
+        switch remoteImageDecision(for: trimmedSource) {
+        case .requiresConfirmation:
+            // HTTPS 只能由确认分支持有请求描述，通用解析入口不得绕过授权。
+            return nil
+        case .blocked:
+            // 明文 HTTP 和残缺 HTTPS 永久拒绝。
+            return nil
+        case .notRemote:
+            // 非远程来源继续执行下方本地路径校验。
+            break
+        }
+
         // 先识别带显式 scheme 的完整 URL。
         if let absoluteURL = URL(string: trimmedSource), let scheme = absoluteURL.scheme?.lowercased() {
-            // 远程图片沿用系统异步请求能力。
-            if scheme == "http" || scheme == "https" {
-                // 只允许两个明确网络协议，危险自定义协议不会进入预览。
-                return absoluteURL
-            }
             // 显式 file URL 可表示用户主动引用的本机图片。
             if scheme == "file", absoluteURL.isFileURL, isSupportedLocalImage(absoluteURL) {
                 // 标准化点路径段后交给本地异步加载器。
@@ -947,65 +1003,61 @@ private struct EnhancedImageView: View {
     let documentURL: URL?
     // 每个可见图片块维护独立的本地异步加载状态。
     @StateObject private var localLoader = EnhancedLocalImageLoader()
+    // 只记录当前图片视图实例内明确点击过的 HTTPS 地址，不写入全局或文档设置。
+    @State private var approvedRemoteURL: URL?
 
     // 根据地址有效性选择异步图片或占位信息。
     @ViewBuilder
     var body: some View {
-        // 统一解析远程、显式 file URL 和文档相对路径。
+        // 先以纯逻辑判断远程协议，判定过程本身不会创建任何网络请求。
+        let remoteDecision = EnhancedImageSourceResolver.remoteImageDecision(for: source)
+        // 本地分支继续解析显式 file URL 和文档相对路径。
         let resolvedURL = EnhancedImageSourceResolver.resolve(source, documentURL: documentURL)
-        // HTTP(S) 地址继续使用系统网络图片组件。
-        if let url = resolvedURL, url.scheme == "http" || url.scheme == "https" {
-            // 系统异步加载不会阻塞 Markdown 解析和输入线程。
-            AsyncImage(url: url) { phase in
-                // 根据加载阶段提供明确反馈。
-                switch phase {
-                case let .success(image):
-                    // 图片按原比例缩放到预览宽度内。
-                    image
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxWidth: .infinity, maxHeight: 520)
-                        .accessibilityLabel(alt.isEmpty ? "Markdown 图片" : alt)
-                case .empty:
-                    // 加载中使用轻量进度指示器。
-                    ProgressView()
-                        .frame(maxWidth: .infinity, minHeight: 96)
-                case .failure:
-                    // 加载失败时显示替代文字和地址，正文信息不会丢失。
-                    imageFallback
-                @unknown default:
-                    // 未知系统状态同样安全回退为文字。
-                    imageFallback
-                }
+        // 按远程策略优先处理永久阻止和逐图确认，不让 HTTPS 落入自动加载路径。
+        switch remoteDecision {
+        case let .requiresConfirmation(request):
+            // 只有当前视图实例已经明确批准同一 URL 时才创建 AsyncImage。
+            if approvedRemoteURL == request.url {
+                // 用户点击后的网络加载仍沿用系统异步图片组件。
+                remoteImage(request.url)
+            } else {
+                // 默认只展示脱敏主机和明确加载按钮。
+                remoteImageConfirmation(request)
             }
-        } else if let url = resolvedURL, url.isFileURL {
-            // Group 统一承载任务，地址变化时即使已有旧图也会重新加载。
-            Group {
-                // 只有加载结果属于当前地址时才显示本地图片。
-                if localLoader.loadedURL == url, let image = localLoader.image {
-                    // AppKit 图片转换为 SwiftUI 图片后支持自适应缩放。
-                    Image(nsImage: image)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxWidth: .infinity, maxHeight: 520)
-                        .accessibilityLabel(alt.isEmpty ? "Markdown 图片" : alt)
-                } else if localLoader.loadedURL == url, localLoader.failed {
-                    // 本地路径失效或内容损坏时保留替代信息。
-                    imageFallback
-                } else {
-                    // 后台读取期间使用轻量进度指示器。
-                    ProgressView()
-                        .frame(maxWidth: .infinity, minHeight: 96)
-                }
-            }
-            // 视图进入可见区域或地址变化后触发后台文件读取。
-            .task(id: url) {
-                // 等待当前图片加载完成或任务被滚动取消。
-                await localLoader.load(url)
-            }
-        } else {
-            // 无文档基址、非法协议或不安全路径明确展示原始引用。
+        case .blocked:
+            // 明文 HTTP 和残缺 HTTPS 永远只显示无网络占位。
             imageFallback
+        case .notRemote:
+            // 只有通过目录和扩展名校验的 file URL 才进入本地加载器。
+            if let url = resolvedURL, url.isFileURL {
+                // Group 统一承载任务，地址变化时即使已有旧图也会重新加载。
+                Group {
+                    // 只有加载结果属于当前地址时才显示本地图片。
+                    if localLoader.loadedURL == url, let image = localLoader.image {
+                        // AppKit 图片转换为 SwiftUI 图片后支持自适应缩放。
+                        Image(nsImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity, maxHeight: 520)
+                            .accessibilityLabel(alt.isEmpty ? "Markdown 图片" : alt)
+                    } else if localLoader.loadedURL == url, localLoader.failed {
+                        // 本地路径失效或内容损坏时保留替代信息。
+                        imageFallback
+                    } else {
+                        // 后台读取期间使用轻量进度指示器。
+                        ProgressView()
+                            .frame(maxWidth: .infinity, minHeight: 96)
+                    }
+                }
+                // 视图进入可见区域或地址变化后触发后台文件读取。
+                .task(id: url) {
+                    // 等待当前图片加载完成或任务被滚动取消。
+                    await localLoader.load(url)
+                }
+            } else {
+                // 无文档基址、非法协议或不安全路径明确展示原始引用。
+                imageFallback
+            }
         }
         // 可选标题作为图片下方说明。
         if let title, !title.isEmpty {
@@ -1015,6 +1067,63 @@ private struct EnhancedImageView: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .center)
         }
+    }
+
+    // 用户确认后才创建系统远程图片组件。
+    private func remoteImage(_ url: URL) -> some View {
+        // AsyncImage 的初始化是唯一可能发起远程图片请求的路径。
+        AsyncImage(url: url) { phase in
+            // 根据加载阶段提供明确反馈。
+            switch phase {
+            case let .success(image):
+                // 图片按原比例缩放到预览宽度内。
+                image
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: 520)
+                    .accessibilityLabel(alt.isEmpty ? "Markdown 图片" : alt)
+            case .empty:
+                // 加载中使用轻量进度指示器。
+                ProgressView()
+                    .frame(maxWidth: .infinity, minHeight: 96)
+            case .failure:
+                // 图片加载失败时保留替代文字，正文信息不会丢失。
+                imageFallback
+            @unknown default:
+                // 未知系统状态同样安全回退为文字。
+                imageFallback
+            }
+        }
+    }
+
+    // 为尚未授权的 HTTPS 图片展示脱敏来源和逐图按钮。
+    private func remoteImageConfirmation(
+        _ request: EnhancedImageSourceResolver.RemoteImageRequest
+    ) -> some View {
+        // 纵向布局确保来源说明和操作按钮在窄预览区仍清晰可读。
+        VStack(alignment: .leading, spacing: 10) {
+            // 明确说明默认未联网，而不是伪装成加载失败。
+            Label("远程图片未加载", systemImage: "hand.raised.fill")
+                .font(.callout.weight(.semibold))
+            // 只显示主机，不展示可能携带令牌或追踪参数的完整 URL。
+            Text("来源：\(request.displayHost)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            // 按钮只批准当前视图实例中的这一条 HTTPS URL。
+            Button("加载远程图片") {
+                // 状态变化后当前分支才会创建 AsyncImage。
+                approvedRemoteURL = request.url
+            }
+            .buttonStyle(.bordered)
+        }
+        // 确认区域占满可用宽度并保持左对齐。
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // 与普通图片占位保持一致内边距。
+        .padding(12)
+        // 使用系统次级背景适配明暗主题。
+        .background(Color.secondary.opacity(0.08))
+        // 圆角与其他图片状态保持一致。
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     // 构造图片不可加载时的原生占位视图。
@@ -1314,7 +1423,7 @@ enum EnhancedMarkdownSelfCheck {
         let actualBytes: Int
         // 保存解析产生的块数量，防止基准调用被无意义省略。
         let blockCount: Int
-        // 保存单次完整解析耗时。
+        // 保存三次完整解析耗时的中位数。
         let milliseconds: Double
         // 保存当前体量的验收阈值。
         let targetMilliseconds: Double
@@ -1377,6 +1486,10 @@ enum EnhancedMarkdownSelfCheck {
         let blockTypesValid = validateBlockTypes(sampleBlocks)
         // 功能模型不正确时立即报告，避免性能数据掩盖语法回归。
         precondition(blockTypesValid, "增强 Markdown 块类型自检失败")
+        // 远程图片协议和确认策略必须由纯逻辑验证，不能依赖真实网络请求。
+        let remoteImagePrivacyValid = validateRemoteImagePrivacy()
+        // HTTP 自动请求或 HTTPS 无确认都会直接终止自检。
+        precondition(remoteImagePrivacyValid, "远程图片隐私策略自检失败")
         // 编辑器纯逻辑覆盖语法 token、Unicode 格式化和大文档降级。
         let editorSupportReport = MarkdownEditorSupportSelfCheck.run()
         // 任一编辑体验断言失败都立即输出具体原因。
@@ -1389,11 +1502,9 @@ enum EnhancedMarkdownSelfCheck {
         // 大纲映射失败不能继续伪装成功。
         precondition(outlineFailures.isEmpty, outlineFailures.joined(separator: "；"))
 
-        // 先执行一个短文档预热，降低首次加载运行库对基准的干扰。
-        _ = EnhancedMarkdownParser.parse("# 预热\n\n- 项目\n")
-        // 测量约 200KB 文档并使用 50ms 目标。
+        // 约 200KB 文档先完整预热，再测三次中位数并使用 50ms 目标。
         let medium = measureDocument(requestedBytes: 200_000, targetMilliseconds: 50)
-        // 测量约 1MB 文档并使用 200ms 目标。
+        // 约 1MB 文档同样完整预热，再测三次中位数并使用 200ms 目标。
         let large = measureDocument(requestedBytes: 1_000_000, targetMilliseconds: 200)
         // 汇总全部功能与性能结果。
         let report = Report(blockTypesValid: blockTypesValid, mediumDocument: medium, largeDocument: large)
@@ -1402,6 +1513,8 @@ enum EnhancedMarkdownSelfCheck {
         if printResults {
             // 输出块类型验证结果。
             print("增强 Markdown 块类型：通过")
+            // 输出远程图片默认不联网的隐私策略结果。
+            print("远程图片隐私：HTTP 已阻止，HTTPS 需逐图确认")
             // 输出 200KB 解析耗时和目标。
             print(format(medium))
             // 输出 1MB 解析耗时和目标。
@@ -1479,7 +1592,44 @@ enum EnhancedMarkdownSelfCheck {
         return true
     }
 
-    // 生成指定体量文档并测量一次完整解析。
+    // 验证远程图片不会因解析或预览默认分支直接联网。
+    private static func validateRemoteImagePrivacy() -> Bool {
+        // 明文 HTTP 无论主机是否合法都必须永久阻止。
+        let httpDecision = EnhancedImageSourceResolver.remoteImageDecision(
+            for: "http://tracker.example/pixel.png?user=secret"
+        )
+        // 只有明确 blocked 才能证明界面不会提供加载入口。
+        guard httpDecision == .blocked else { return false }
+        // 解析器入口也不能把 HTTP 返回为可加载 URL。
+        guard
+            EnhancedImageSourceResolver.resolve(
+                "http://tracker.example/pixel.png",
+                documentURL: nil
+            ) == nil
+        else { return false }
+
+        // HTTPS 地址必须转换成尚待确认的纯数据描述。
+        let httpsDecision = EnhancedImageSourceResolver.remoteImageDecision(
+            for: "https://Images.Example.com/pixel.png?token=secret"
+        )
+        // 提取确认请求以核对真实 URL 和脱敏主机展示。
+        guard case let .requiresConfirmation(request) = httpsDecision else { return false }
+        // 展示值只能保留小写主机，不能包含路径、查询或令牌。
+        guard request.displayHost == "images.example.com" else { return false }
+        // 请求 URL 必须仍保持 HTTPS，用户确认后才能交给 AsyncImage。
+        guard request.url.scheme?.lowercased() == "https" else { return false }
+        // 通用解析器不得返回未确认的 HTTPS URL，避免后续调用方绕过界面授权。
+        guard
+            EnhancedImageSourceResolver.resolve(
+                "https://images.example.com/pixel.png",
+                documentURL: nil
+            ) == nil
+        else { return false }
+        // 完整隐私策略符合预期。
+        return true
+    }
+
+    // 生成指定体量文档，完整预热后测三次并返回中位数。
     private static func measureDocument(requestedBytes: Int, targetMilliseconds: Double) -> Measurement {
         // 基准单元覆盖标题、行内语法、任务列表、引用、代码和表格。
         let unit = """
@@ -1505,18 +1655,38 @@ enum EnhancedMarkdownSelfCheck {
         let repetitions = Int(ceil(Double(requestedBytes) / Double(unit.utf8.count)))
         // 一次性生成基准文档，生成耗时不计入解析数据。
         let document = String(repeating: unit, count: repetitions)
-        // 使用系统单调时钟记录解析起点。
-        let startedAt = ProcessInfo.processInfo.systemUptime
-        // 执行与应用集成入口相同的完整块解析。
-        let blocks = EnhancedMarkdownParser.parse(document)
-        // 使用同一单调时钟换算毫秒耗时。
-        let milliseconds = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
+        // 先完整解析同一目标文档，预热对应体量的分配器和解析热路径。
+        let expectedBlockCount = EnhancedMarkdownParser.parse(document).count
+        // 非空基准必须生成真实块，防止性能调用退化成空操作。
+        precondition(expectedBlockCount > 0, "性能基准未生成 Markdown 块")
+        // 保存三次独立完整解析耗时供中位数消除远端 CI 瞬时抖动。
+        var measurements: [Double] = []
+        // 固定容量避免数组扩容噪声进入测量之间的控制路径。
+        measurements.reserveCapacity(3)
+        // 固定执行三次，不放宽任何体量或时间阈值。
+        for _ in 0..<3 {
+            // 使用系统单调时钟记录本次完整解析起点。
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            // 执行与应用集成入口相同的完整块解析。
+            let blocks = EnhancedMarkdownParser.parse(document)
+            // 使用同一单调时钟换算本次毫秒耗时。
+            let milliseconds = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
+            // 每次块数量必须与完整预热一致，防止不稳定结果伪装性能通过。
+            precondition(
+                blocks.count == expectedBlockCount,
+                "性能基准块数量不一致：预期 \(expectedBlockCount)，实际 \(blocks.count)"
+            )
+            // 只在结果完整一致后记录本次耗时。
+            measurements.append(milliseconds)
+        }
+        // 三个样本排序后的中间值可屏蔽一次远端 CI 调度尖峰。
+        let medianMilliseconds = measurements.sorted()[1]
         // 返回包含实际字节数、块数量和阈值的结构化结果。
         return Measurement(
             requestedBytes: requestedBytes,
             actualBytes: document.utf8.count,
-            blockCount: blocks.count,
-            milliseconds: milliseconds,
+            blockCount: expectedBlockCount,
+            milliseconds: medianMilliseconds,
             targetMilliseconds: targetMilliseconds
         )
     }

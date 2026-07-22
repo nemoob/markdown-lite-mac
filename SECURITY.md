@@ -2,13 +2,13 @@
 
 ## Supported versions
 
-安全修复优先进入默认分支和最新标记版本。项目处于早期阶段，旧版本目前不承诺长期回补；建议先在最新代码上确认问题仍然存在。
+v0.4.x 是 Markdown Lite 的首个公开 Beta。安全修复优先进入[默认分支和最新标记版本](https://github.com/nemoob/markdown-lite-mac)；v0.1.x 至 v0.3.x 属于公开发布前的开发记录，不承诺回补。建议先在最新代码上确认问题仍然存在。
 
 ## Reporting a vulnerability
 
 请不要在公开 issue、discussion 或 pull request 中披露尚未修复的漏洞、利用步骤、个人文档或本机路径。
 
-优先使用仓库的 **Private vulnerability reporting / GitHub Security Advisory** 私下提交报告。如果该入口尚未启用，请创建一个不含敏感细节的普通 issue，仅请求维护者提供私下联系方式。
+优先使用仓库 [Security 页面](https://github.com/nemoob/markdown-lite-mac/security) 提供的 **Report a vulnerability / GitHub Security Advisory** 私下提交报告。如果该入口尚未启用，请创建一个 [不含敏感细节的普通 issue](https://github.com/nemoob/markdown-lite-mac/issues/new)，仅请求维护者提供私下联系方式。
 
 报告尽量包含：
 
