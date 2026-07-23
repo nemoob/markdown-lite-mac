@@ -2,7 +2,23 @@
 
 本文件记录 Markdown Lite 的用户可见变化。版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+> 发布状态：0.7.0 至 0.10.0 章节是未创建 tag 或 GitHub Release 的开发检查点；公开版本只以 [GitHub Releases](https://github.com/nemoob/markdown-lite-mac/releases) 为准。
+
 ## [Unreleased]
+
+## [0.11.0] - 2026-07-23
+
+### Added
+
+- 状态栏增加当前标签的字符数、行数和非空选区字符数；全文与选区统计都在可取消后台任务中执行，并按 Unicode 扩展字素簇计数。
+- 增加真实应用子进程 `SIGKILL` 后的工作区与草稿恢复测试，以及 10 个 1MB dirty 标签退出同步刷盘的 release 性能门禁。
+
+### Changed
+
+- 只有活动标签自动生成预览；后台标签停止解析，切回时再追平最新正文，避免恢复多个大文档时并发消耗 CPU 和内存。
+- 超过 5 MiB 的活动文档默认暂停自动预览，并提供一次性手动刷新入口；后续输入重新应用自动保护。
+- 崩溃恢复进程夹具只编入 Debug；统一检查会阻止测试命令行入口进入 Release 可执行文件。
+- 版本统一为 0.11.0（build 11），作为只附源码、不上传本地或 CI 应用包的 source-only prerelease。
 
 ## [0.10.0] - 2026-07-23
 

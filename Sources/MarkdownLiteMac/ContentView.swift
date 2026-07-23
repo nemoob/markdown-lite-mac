@@ -453,7 +453,11 @@ private struct WorkspaceEditorView: View {
                         isActive: candidate.id == workspace.activeDocumentID,
                         onSelectionLineChanged: candidate.id == workspace.activeDocumentID
                             ? updateEditorLine
-                            : nil
+                            : nil,
+                        onSelectedCharacterCountChanged: { count in
+                            // 协调器只从活动 NSTextView 回调，精确写回所属标签统计。
+                            candidate.updateSelectedCharacterCount(count)
+                        }
                     )
                     .opacity(candidate.id == workspace.activeDocumentID ? 1 : 0)
                     .allowsHitTesting(candidate.id == workspace.activeDocumentID)
@@ -548,42 +552,70 @@ private struct WorkspaceEditorView: View {
             .padding(.horizontal, 14)
             .frame(height: 34)
             Divider()
-            HStack(spacing: 0) {
-                if isOutlineVisible {
-                    MarkdownOutlineView(
-                        items: items,
-                        currentItemID: MarkdownOutlineBuilder.currentItem(
-                            from: items,
-                            atLine: editorLine
-                        )?.id
-                    ) { item in
-                        jump(to: item)
+            // 超大文档自动暂停时以明确说明替代旧预览，避免误看过期内容。
+            if document.previewPauseReason == .documentTooLarge {
+                largeDocumentPreviewPauseView
+            } else {
+                HStack(spacing: 0) {
+                    if isOutlineVisible {
+                        MarkdownOutlineView(
+                            items: items,
+                            currentItemID: MarkdownOutlineBuilder.currentItem(
+                                from: items,
+                                atLine: editorLine
+                            )?.id
+                        ) { item in
+                            jump(to: item)
+                        }
+                        .frame(width: 190)
+                        Divider()
                     }
-                    .frame(width: 190)
-                    Divider()
+                    EnhancedMarkdownPreview(
+                        blocks: document.previewBlocks,
+                        documentURL: document.currentFileURL,
+                        scrollTargetLine: previewTargetLine,
+                        onToggleTask: { sourceLine, expectedText, expectedChecked in
+                            // 正文已变化但新预览尚未完成时拒绝旧复选框操作。
+                            guard document.isPreviewCurrent else { return }
+                            // 原生编辑器继续核对标签、源行、正文和旧状态后执行可撤销替换。
+                            NativeEditorActions.toggleTask(
+                                atLine: sourceLine,
+                                expectedSource: document.text,
+                                expectedText: expectedText,
+                                expectedChecked: expectedChecked,
+                                documentID: document.id
+                            )
+                        }
+                    )
+                    // 文档切换时重建预览树，避免远程图片确认状态跨标签复用。
+                    .id(document.id)
+                    .background(Color(nsColor: .textBackgroundColor))
                 }
-                EnhancedMarkdownPreview(
-                    blocks: document.previewBlocks,
-                    documentURL: document.currentFileURL,
-                    scrollTargetLine: previewTargetLine,
-                    onToggleTask: { sourceLine, expectedText, expectedChecked in
-                        // 正文已变化但新预览尚未完成时拒绝旧复选框操作。
-                        guard document.isPreviewCurrent else { return }
-                        // 原生编辑器继续核对标签、源行、正文和旧状态后执行可撤销替换。
-                        NativeEditorActions.toggleTask(
-                            atLine: sourceLine,
-                            expectedSource: document.text,
-                            expectedText: expectedText,
-                            expectedChecked: expectedChecked,
-                            documentID: document.id
-                        )
-                    }
-                )
-                // 文档切换时重建预览树，避免远程图片确认状态跨标签复用。
-                .id(document.id)
-                .background(Color(nsColor: .textBackgroundColor))
             }
         }
+    }
+
+    // 大文档默认停止自动解析，用户仍可明确承担一次预览成本。
+    private var largeDocumentPreviewPauseView: some View {
+        VStack(spacing: 12) {
+            // 系统图标提供不带警告色的性能保护提示。
+            Image(systemName: "pause.circle")
+                .font(.system(size: 28))
+                .foregroundStyle(.secondary)
+            // 文案直接复用模型策略，避免阈值在两处漂移。
+            Text(PreviewWorkPauseReason.documentTooLarge.displayMessage)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+            // 手动刷新只放行当前正文一次，后续输入重新应用五 MiB 上限。
+            Button("仍要生成一次预览") {
+                document.refreshPreviewManually()
+            }
+            .buttonStyle(.bordered)
+            .accessibilityHint("本次可能消耗较多内存和处理时间")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     // 状态栏只展示可行动反馈和真实后台解析耗时，避免长文输入时逐键遍历全部字符。
@@ -607,12 +639,49 @@ private struct WorkspaceEditorView: View {
                 .help("在 Finder 中显示最近一次会话恢复归档")
                 .accessibilityLabel("在 Finder 中显示最近一次会话恢复归档")
             }
-            Text("预览 \(document.renderMilliseconds, specifier: "%.1f") ms")
+            // 状态栏只读取后台已发布的整数，不在 SwiftUI body 内扫描正文。
+            Text(writingStatisticsText)
+                .lineLimit(1)
+                .accessibilityLabel(writingStatisticsAccessibilityLabel)
+            // 大文档暂停时不把上一次解析耗时误认为当前正文结果。
+            if document.previewPauseReason == .documentTooLarge {
+                Text("预览已暂停")
+            } else {
+                Text("预览 \(document.renderMilliseconds, specifier: "%.1f") ms")
+            }
         }
         .font(.caption2)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .frame(height: 28)
+    }
+
+    // 组合紧凑可见统计；空选区不占用额外状态栏宽度。
+    private var writingStatisticsText: String {
+        // 读取当前标签后台结果，标签切换不会短暂复用上一标签数据。
+        let statistics = document.writingStatistics
+        // 非空选区追加用户当前最关心的局部数量。
+        if statistics.selectedCharacterCount > 0 {
+            return
+                "字符 \(statistics.characterCount) · 行 \(statistics.lineCount)"
+                + " · 已选 \(statistics.selectedCharacterCount)"
+        }
+        // 普通光标状态只展示全文字符和行数。
+        return "字符 \(statistics.characterCount) · 行 \(statistics.lineCount)"
+    }
+
+    // VoiceOver 使用自然中文朗读完整统计，但不注册高频实时播报区域。
+    private var writingStatisticsAccessibilityLabel: String {
+        // 读取当前标签最新已发布结果。
+        let statistics = document.writingStatistics
+        // 非空选区包含选中数量。
+        if statistics.selectedCharacterCount > 0 {
+            return
+                "全文 \(statistics.characterCount) 个字符，\(statistics.lineCount) 行，"
+                + "已选择 \(statistics.selectedCharacterCount) 个字符"
+        }
+        // 空选区只朗读全文结果。
+        return "全文 \(statistics.characterCount) 个字符，\(statistics.lineCount) 行"
     }
 
     // 把可能丢弃或覆盖内容的动作集中在醒目的冲突菜单中。
@@ -993,6 +1062,8 @@ private struct PersistentDocumentEditor: View {
     let isActive: Bool
     // 活动编辑器光标跨行时通知预览和大纲。
     let onSelectionLineChanged: ((Int) -> Void)?
+    // 活动编辑器选区变化时更新当前标签统计。
+    let onSelectedCharacterCountChanged: ((Int) -> Void)?
     // 字号设置跨启动持久化并即时传给原生编辑器。
     @AppStorage("editorFontSize") private var fontSize = EditorPreferenceDefaults.fontSize
     // 行距设置只改变显示，不写入 Markdown 原文。
@@ -1020,7 +1091,8 @@ private struct PersistentDocumentEditor: View {
                 // 只在原生撤销或重做后按保存快照精确校准当前标签 dirty 状态。
                 document.reconcileDirtyAfterUndoRedo()
             },
-            onSelectionLineChanged: onSelectionLineChanged
+            onSelectionLineChanged: onSelectionLineChanged,
+            onSelectedCharacterCountChanged: onSelectedCharacterCountChanged
         )
     }
 }

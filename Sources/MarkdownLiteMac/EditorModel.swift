@@ -47,6 +47,14 @@ final class EditorModel: ObservableObject, Identifiable {
     @Published private(set) var status: String
     // 当前标签最近一次有效预览耗时。
     @Published private(set) var renderMilliseconds = 0.0
+    // 自动预览暂停时保存可展示原因，手动刷新成功后恢复正常耗时展示。
+    @Published private(set) var previewPauseReason: PreviewWorkPauseReason?
+    // 当前标签的全文与选区统计由后台任务计算，状态栏只读取常量时间结果。
+    @Published private(set) var writingStatistics = WritingStatistics(
+        characterCount: 0,
+        lineCount: 1,
+        selectedCharacterCount: 0
+    )
     // 标签标题使用真实文件名或稳定未命名标题。
     @Published private(set) var filename: String
     // dirty 只表示当前标签尚未写回真实文件。
@@ -81,6 +89,12 @@ final class EditorModel: ObservableObject, Identifiable {
     private var isReplacingDocument = false
     // 每个标签持有自己的后台预览任务。
     private var previewTask: Task<Void, Never>?
+    // 只有工作区活动标签允许启动自动预览和写作统计任务。
+    private var isPreviewActive = true
+    // 写作统计与预览分开取消，较慢的全文计数不能覆盖新正文。
+    private var writingStatisticsTask: Task<Void, Never>?
+    // 每次正文变化推进统计代次，保证只接受最新结果。
+    private var writingStatisticsGeneration = 0
     // 每个标签独立递增版本，过期结果不会跨标签回写。
     private var previewGeneration = 0
     // 保存当前 previewBlocks 实际对应的正文代次，供交互预览拒绝旧动作。
@@ -201,6 +215,8 @@ final class EditorModel: ObservableObject, Identifiable {
         self.status = status
         // 首屏预览也离开主线程，避免会话恢复多个大文件时卡住窗口。
         schedulePreview(after: .zero)
+        // 首屏统计同样在后台执行，初始化不能同步遍历大正文。
+        scheduleWritingStatistics(after: .zero)
     }
 
     // 将草稿捕获时的摘要恢复成仅用于内容比较的可信磁盘基线。
@@ -542,6 +558,8 @@ final class EditorModel: ObservableObject, Identifiable {
         isDirty = true
         // 当前标签停顿 120ms 后在后台解析。
         schedulePreview(after: .milliseconds(120))
+        // 同一停顿窗口合并全文统计，避免逐键重复扫描。
+        scheduleWritingStatistics(after: .milliseconds(120))
         // 当前标签旧草稿任务已经过期。
         draftTimer?.invalidate()
         // 取消上一轮仅用于状态回写的后台任务。
@@ -639,15 +657,29 @@ final class EditorModel: ObservableObject, Identifiable {
     }
 
     // 在后台解析当前标签，只接受最新一代结果。
-    private func schedulePreview(after delay: Duration) {
+    private func schedulePreview(
+        after delay: Duration,
+        trigger: PreviewWorkTrigger = .automatic
+    ) {
         // 取消当前标签尚未开始的旧任务。
         previewTask?.cancel()
         // 当前标签版本号独立递增。
         previewGeneration &+= 1
         // 捕获本次版本用于回写核对。
         let generation = previewGeneration
+        // 后台标签的自动请求直接结束，连正文快照和字节统计都不创建。
+        if trigger == .automatic, !isPreviewActive {
+            // 保存稳定原因供测试和后续激活时识别当前状态。
+            previewPauseReason = .backgroundTab
+            // 后台标签等待激活入口重新安排最新正文。
+            return
+        }
         // String 写时复制提供低成本正文快照。
         let markdown = text
+        // 捕获活动状态，后台任务不得跨 actor 读取可变模型。
+        let capturedIsActive = isPreviewActive
+        // 新请求开始后先清除旧暂停原因，避免手动刷新期间仍显示暂停页。
+        previewPauseReason = nil
         // 外层任务负责节流和最新结果回写。
         previewTask = Task { [weak self] in
             do {
@@ -659,10 +691,24 @@ final class EditorModel: ObservableObject, Identifiable {
             }
             // 已取消任务不再消耗解析 CPU。
             guard !Task.isCancelled else { return }
-            // detached 任务让大文档解析离开主线程，并返回可由取消路径丢弃的可选结果。
-            let parseTask = Task.detached(priority: .userInitiated) { () -> ([EnhancedPreviewBlock], Double)? in
+            // detached 任务先在后台统计字节并执行策略，再按需解析正文。
+            let parseTask = Task.detached(priority: .userInitiated) {
+                () -> (PreviewWorkPauseReason?, [EnhancedPreviewBlock], Double)? in
                 // 外层任务在 detached 启动前取消时不进入解析器。
                 guard !Task.isCancelled else { return nil }
+                // UTF-8 计数可能遍历大正文，必须与输入主线程隔离。
+                let byteCount = markdown.utf8.count
+                // 统一策略决定后台、超大文档或手动请求能否继续。
+                let decision = PreviewWorkPolicy.decision(
+                    isActiveDocument: capturedIsActive,
+                    documentByteCount: byteCount,
+                    trigger: trigger
+                )
+                // 自动请求被暂停时不进入完整 Markdown 解析。
+                if let pauseReason = decision.pauseReason {
+                    // 只返回原因，不制造无意义的预览块。
+                    return (pauseReason, [], 0)
+                }
                 // 单调时钟记录本次真实解析耗时。
                 let startedAt = ProcessInfo.processInfo.systemUptime
                 // 线性扫描生成增强块。
@@ -671,8 +717,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 guard !Task.isCancelled else { return nil }
                 // 换算成毫秒供当前标签状态栏展示。
                 let milliseconds = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
-                // 一次返回块和耗时。
-                return (blocks, milliseconds)
+                // 一次返回无暂停标记、预览块和耗时。
+                return (nil, blocks, milliseconds)
             }
             // 外层节流任务取消时显式传播给不继承取消状态的 detached 解析任务。
             let result = await withTaskCancellationHandler {
@@ -686,12 +732,130 @@ final class EditorModel: ObservableObject, Identifiable {
             guard !Task.isCancelled, let result else { return }
             // 只有同一标签最新版本可以回写。
             guard let self, self.previewGeneration == generation else { return }
+            // 策略暂停时只发布原因，不能把空数组伪装成成功预览。
+            if let pauseReason = result.0 {
+                // 大文档提示由界面提供单次手动刷新入口。
+                self.previewPauseReason = pauseReason
+                // 暂停代次没有对应可交互预览。
+                return
+            }
+            // 成功解析清除之前的大文档暂停状态。
+            self.previewPauseReason = nil
             // 先标记结果所属代次，随后发布的块视图即可安全开放交互。
             self.appliedPreviewGeneration = generation
             // 更新当前标签预览块。
-            self.previewBlocks = result.0
+            self.previewBlocks = result.1
             // 更新当前标签解析耗时。
-            self.renderMilliseconds = result.1
+            self.renderMilliseconds = result.2
+        }
+    }
+
+    // 工作区在活动标签变化后同步每个模型的后台工作资格。
+    func setPreviewActive(_ isActive: Bool) {
+        // 相同状态不重复取消或重建任务。
+        guard isPreviewActive != isActive else { return }
+        // 先保存新状态供后续自动策略读取。
+        isPreviewActive = isActive
+        // 标签进入后台时立即停止未完成解析。
+        guard isActive else {
+            // 取消当前解析及其 detached 子任务。
+            previewTask?.cancel()
+            // 只有尚未追平的请求需要推进代次；已完成预览可安全跨标签复用。
+            if !isPreviewCurrent {
+                // 推进代次，防止恰好完成的旧结果回写。
+                previewGeneration &+= 1
+            }
+            // 后台原因不会在隐藏界面展示，但能准确描述当前策略状态。
+            previewPauseReason = .backgroundTab
+            // 后台标签不继续执行尚未完成的全文统计。
+            writingStatisticsTask?.cancel()
+            // 推进统计代次，防止取消边界上的旧结果回写。
+            writingStatisticsGeneration &+= 1
+            // 等待重新激活后再处理最新正文。
+            return
+        }
+        // 正文未变化且已有当前预览时直接复用，切换标签不重复解析。
+        if isPreviewCurrent {
+            // 清除仅用于后台状态的暂停原因。
+            previewPauseReason = nil
+        } else {
+            // 没有当前预览时立即为最新正文安排自动解析。
+            schedulePreview(after: .zero)
+        }
+        // 切回活动标签时同步追平最新全文统计。
+        scheduleWritingStatistics(after: .zero)
+    }
+
+    // 用户可为当前活动大文档显式执行一次不受大小限制的预览。
+    func refreshPreviewManually() {
+        // 后台标签没有可见预览入口，拒绝程序化误调用。
+        guard isPreviewActive else { return }
+        // 手动触发只放行当前请求，后续输入仍恢复自动大小限制。
+        schedulePreview(after: .zero, trigger: .manualRefresh)
+    }
+
+    // 原生编辑器把后台计算好的选区字符数回写到当前标签。
+    func updateSelectedCharacterCount(_ count: Int) {
+        // 防御外部误调用，状态栏不接受负数。
+        let safeCount = max(0, count)
+        // 相同结果不触发无意义的 SwiftUI 刷新。
+        guard writingStatistics.selectedCharacterCount != safeCount else { return }
+        // 保留已完成的全文统计，只替换当前选区结果。
+        writingStatistics = WritingStatistics(
+            characterCount: writingStatistics.characterCount,
+            lineCount: writingStatistics.lineCount,
+            selectedCharacterCount: safeCount
+        )
+    }
+
+    // 合并连续输入后在后台统计当前标签全文，只接受最新代次。
+    private func scheduleWritingStatistics(after delay: Duration) {
+        // 新正文或标签切换先取消旧统计等待。
+        writingStatisticsTask?.cancel()
+        // 每次请求推进独立代次。
+        writingStatisticsGeneration &+= 1
+        // 捕获代次供主线程回写前核对。
+        let generation = writingStatisticsGeneration
+        // 后台标签保留最近结果，激活时再为最新正文补算。
+        guard isPreviewActive else { return }
+        // String 写时复制只捕获当前正文，不在主线程遍历字符。
+        let source = text
+        // 外层任务负责节流、取消传播和最新结果回写。
+        writingStatisticsTask = Task { [weak self] in
+            do {
+                // 等待连续输入稳定。
+                try await ContinuousClock().sleep(for: delay)
+            } catch {
+                // 新输入或标签切换取消属于正常路径。
+                return
+            }
+            // 取消后不再创建全文统计任务。
+            guard !Task.isCancelled else { return }
+            // 字符和行扫描进入 utility 后台任务，避免影响输入响应。
+            let calculationTask = Task.detached(priority: .utility) {
+                // 选区由原生编辑器独立计算；全文扫描在任务取消时返回 nil。
+                WritingStatisticsSupport.calculateIfNotCancelled(in: source)
+            }
+            // 外层取消时显式传播给 detached 任务并丢弃其结果。
+            let result = await withTaskCancellationHandler {
+                // 正常路径等待纯统计完成。
+                await calculationTask.value
+            } onCancel: {
+                // 将取消传给周期检查状态的全文扫描，使旧快照尽快释放。
+                calculationTask.cancel()
+            }
+            // 仅同一标签最新代次可以更新状态栏。
+            guard !Task.isCancelled,
+                let self,
+                let result,
+                self.writingStatisticsGeneration == generation
+            else { return }
+            // 保留原生选区的最新结果，全文任务不能把它重置成零。
+            self.writingStatistics = WritingStatistics(
+                characterCount: result.characterCount,
+                lineCount: result.lineCount,
+                selectedCharacterCount: self.writingStatistics.selectedCharacterCount
+            )
         }
     }
 
@@ -959,6 +1123,10 @@ final class EditorModel: ObservableObject, Identifiable {
             try? documentStore.removeDraft(for: currentFileURL)
             // 立即刷新预览，不等待下一次输入。
             schedulePreview(after: .zero)
+            // 整体换文没有触发 contentChanged，先清除旧选区统计。
+            updateSelectedCharacterCount(0)
+            // 取消旧正文统计、推进代次并立即为磁盘新正文重新计算。
+            scheduleWritingStatistics(after: .zero)
             // 告知用户磁盘版本已安全采用。
             status = discardingChanges ? "已放弃当前编辑并重载磁盘版本" : "已重新载入磁盘版本"
             // 返回重载成功。
@@ -1250,6 +1418,8 @@ final class EditorModel: ObservableObject, Identifiable {
         draftWriteTask?.cancel()
         // 停止预览任务，避免无界面回写。
         previewTask?.cancel()
+        // 停止全文统计任务，关闭标签后不再发布状态栏结果。
+        writingStatisticsTask?.cancel()
         // 停止尚未完成的 HTML 图片读取和目标写入。
         exportTask?.cancel()
     }

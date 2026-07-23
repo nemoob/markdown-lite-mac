@@ -15,7 +15,7 @@ struct WorkspaceEndToEndPerformanceTests {
     private static let measuredIterations = 3
     // 本机约 36ms，500ms 为较慢 CI 保留充足调度和磁盘余量。
     private static let oneTabRestoreTargetMilliseconds = 500.0
-    // 本机约 51ms，十标签并发预览必须在 1.5 秒内全部可用。
+    // 十标签恢复只解析活动标签，整体模型与首轮可见预览必须在 1.5 秒内可用。
     private static let tenTabRestoreTargetMilliseconds = 1_500.0
     // 本机约 6ms，一百个空标签的模型扩展不得超过半秒。
     private static let hundredTabRestoreTargetMilliseconds = 500.0
@@ -36,9 +36,9 @@ struct WorkspaceEndToEndPerformanceTests {
     private struct Report {
         // 一个 1MB 标签从会话到预览追平的中位数。
         let oneTabRestoreMilliseconds: Double
-        // 十个 1MB 标签从会话到全部预览追平的中位数。
+        // 十个 1MB 标签从会话到活动预览追平的中位数。
         let tenTabRestoreMilliseconds: Double
-        // 一百个空标签从会话到全部预览追平的中位数。
+        // 一百个空标签从会话到活动预览追平的中位数。
         let hundredTabRestoreMilliseconds: Double
         // 50MB 文件通过工作区入口打开的中位数。
         let largeFileOpenMilliseconds: Double
@@ -121,7 +121,7 @@ struct WorkspaceEndToEndPerformanceTests {
         #expect(report.peakResidentMegabytes > 0)
         // 单个 1MB 标签恢复必须低于发布硬上限。
         #expect(report.oneTabRestoreMilliseconds < Self.oneTabRestoreTargetMilliseconds)
-        // 十个 1MB 标签及全部首轮预览必须低于发布硬上限。
+        // 十个 1MB 标签及活动标签首轮预览必须低于发布硬上限。
         #expect(report.tenTabRestoreMilliseconds < Self.tenTabRestoreTargetMilliseconds)
         // 一百空标签的会话和模型恢复必须低于发布硬上限。
         #expect(report.hundredTabRestoreMilliseconds < Self.hundredTabRestoreTargetMilliseconds)
@@ -139,7 +139,7 @@ struct WorkspaceEndToEndPerformanceTests {
         #expect(report.peakResidentMegabytes < Self.peakResidentTargetMegabytes)
     }
 
-    // 建立指定标签数的真实会话，并测量模型恢复到全部预览可用。
+    // 建立指定标签数的真实会话，并测量模型恢复到活动预览可用。
     @MainActor
     private func measureWorkspaceRestore(tabCount: Int, draftText: String?) async throws -> Double {
         // 每轮使用唯一目录，避免系统缓存之外的应用状态串扰。
@@ -183,8 +183,8 @@ struct WorkspaceEndToEndPerformanceTests {
         )
         // 无论后续断言是否通过都停止延迟预览和草稿任务。
         defer { workspace.documents.forEach { $0.prepareForClose() } }
-        // 等到所有标签首轮预览都对应当前正文，才算端到端恢复完成。
-        try await waitForCurrentPreviews(in: workspace, timeoutSeconds: 15)
+        // 只等待活动标签首轮预览；后台标签必须保持暂停而不是参与并发解析。
+        try await waitForActivePreview(in: workspace, timeoutSeconds: 15)
         // 预览追平后记录完整耗时。
         let elapsed = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
 
@@ -192,6 +192,12 @@ struct WorkspaceEndToEndPerformanceTests {
         #expect(workspace.documents.count == tabCount)
         // 最后一个 UUID 必须继续保持活动状态。
         #expect(workspace.activeDocumentID == documentIDs.last)
+        // 非活动标签必须全部进入后台暂停状态，不能偷偷完成旧并发预览。
+        #expect(
+            workspace.documents
+                .filter { $0.id != workspace.activeDocumentID }
+                .allSatisfy { $0.previewPauseReason == .backgroundTab && !$0.isPreviewCurrent }
+        )
         // 有草稿时每个标签都必须恢复完整 UTF-8 字节数。
         if let draftText {
             // 逐个核对可防止只恢复首个标签却伪报速度。
@@ -255,8 +261,8 @@ struct WorkspaceEndToEndPerformanceTests {
             let document = try #require(workspace.activeDocument)
             // 打开必须完整保留 50MB 正文。
             #expect(document.text.utf8.count == Self.fiftyMegabytes)
-            // 打开计时完成后取消大文件后台预览，避免无界解析干扰独立保存和 RSS 口径。
-            document.prepareForClose()
+            // 打开计时完成后模拟标签进入后台，停止预览和统计干扰独立保存与 RSS 口径。
+            document.setPreviewActive(false)
             // 在计时外追加一个字节，保证保存执行真实不同内容写入。
             document.text.append("y")
 
@@ -356,23 +362,16 @@ struct WorkspaceEndToEndPerformanceTests {
         return median(measurements)
     }
 
-    // 等待工作区所有标签预览与当前正文代次一致。
+    // 等待工作区活动标签预览与当前正文代次一致。
     @MainActor
-    private func waitForCurrentPreviews(
+    private func waitForActivePreview(
         in workspace: WorkspaceModel,
         timeoutSeconds: Double
     ) async throws {
-        // 复用单文档轮询条件并使用同一个绝对截止时间。
-        let deadline = ProcessInfo.processInfo.systemUptime + timeoutSeconds
-        // 任何标签仍未追平时继续短暂让出主 actor。
-        while !workspace.documents.allSatisfy(\.isPreviewCurrent) {
-            // 超时明确失败，避免性能回归让 CI 永久挂起。
-            guard ProcessInfo.processInfo.systemUptime < deadline else {
-                throw PerformanceTestError.previewTimeout
-            }
-            // 两毫秒轮询远小于性能门槛且不会忙等占满主线程。
-            try await Task.sleep(for: .milliseconds(2))
-        }
+        // 活动 UUID 必须解析到当前工作区实际持有的标签。
+        let activeDocument = try #require(workspace.activeDocument)
+        // 复用单文档轮询，保持相同超时和调度口径。
+        try await waitForCurrentPreview(in: activeDocument, timeoutSeconds: timeoutSeconds)
     }
 
     // 等待单标签最新预览追平正文。

@@ -385,6 +385,8 @@ struct NativeTextEditor: NSViewRepresentable {
     var onUndoRedoTextChange: (() -> Void)?
     // 光标行变化时通知上层更新当前大纲章节。
     var onSelectionLineChanged: ((Int) -> Void)?
+    // 选区变化时通知当前文档更新后台计算好的字符数。
+    var onSelectedCharacterCountChanged: ((Int) -> Void)?
 
     // 协调器接收 AppKit 文本变化事件。
     @MainActor
@@ -740,35 +742,89 @@ struct NativeTextEditor: NSViewRepresentable {
                 editedRange: textView.selectedRange(),
                 delayNanoseconds: 80_000_000
             )
+            // 正文替换后选区通常折叠，主动刷新统计而不依赖额外 AppKit 通知。
+            scheduleSelectionUpdate(for: textView, delayNanoseconds: 50_000_000)
         }
 
-        // 原生选区变化时异步计算当前逻辑行。
+        // 原生选区变化时异步计算当前逻辑行和选区字符数。
         func textViewDidChangeSelection(_ notification: Notification) {
-            // 没有上层消费者时不产生任何行扫描成本。
+            // 只处理真实 NSTextView 通知。
+            guard let textView = notification.object as? NSTextView else { return }
+            // 统一入口合并连续方向键、鼠标拖选和输入法选区事件。
+            scheduleSelectionUpdate(for: textView, delayNanoseconds: 50_000_000)
+        }
+
+        // 在单个后台任务中计算光标行和选区字符数，避免重复捕获全文。
+        func scheduleSelectionUpdate(
+            for textView: NSTextView,
+            delayNanoseconds: UInt64
+        ) {
+            // 后台标签或没有消费者时不产生任何扫描成本。
             guard parent.isActive,
-                parent.onSelectionLineChanged != nil,
-                let textView = notification.object as? NSTextView
+                parent.onSelectionLineChanged != nil || parent.onSelectedCharacterCountChanged != nil
             else { return }
-            // 捕获不可变正文和 UTF-16 光标位置供后台计算。
+            // 捕获不可变正文供后台行号和 Unicode 选区计算共用。
             let source = textView.string
-            // 主选区起点代表当前光标章节。
-            let location = textView.selectedRange().location
-            // 新选区使旧行号结果过期。
+            // AppKit 选区使用 UTF-16 范围，完整传给安全转换层。
+            let selection = textView.selectedRange()
+            // 捕获本轮真正需要的结果，后台不能读取随后变化的父视图。
+            let needsLine = parent.onSelectionLineChanged != nil
+            // 选区消费者可独立于大纲行号启用。
+            let needsSelectedCharacterCount = parent.onSelectedCharacterCountChanged != nil
+            // 新选区使旧结果过期。
             selectionTask?.cancel()
-            // 短节流合并连续方向键和输入法选区事件。
+            // 短节流合并连续选区事件。
             selectionTask = Task { [weak self] in
-                // 等待选区稳定。
-                try? await Task.sleep(nanoseconds: 50_000_000)
-                // 取消任务不能继续回写旧章节。
+                // 等待选区稳定；首次激活允许零延迟。
+                if delayNanoseconds > 0 {
+                    // 取消错误属于正常合并路径。
+                    try? await Task.sleep(nanoseconds: delayNanoseconds)
+                }
+                // 取消任务不能继续回写旧结果。
                 guard !Task.isCancelled else { return }
-                // 行扫描离开主线程，避免文档末尾光标卡顿。
-                let line = await Task.detached(priority: .utility) {
-                    MarkdownSourceLineMap.lineNumber(in: source, utf16Location: location)
-                }.value
-                // 再次确认任务仍是最新结果。
+                // 两项扫描一起离开主线程，避免文档末尾光标和长选区卡顿。
+                let scanTask = Task.detached(priority: .utility) { () -> (Int?, Int?) in
+                    // 长选区先走可取消入口，取消时不返回部分字符数。
+                    let selectedCharacterCount =
+                        needsSelectedCharacterCount
+                        ? WritingStatisticsSupport.selectedCharacterCountIfNotCancelled(
+                            in: source,
+                            selectionUTF16Range: selection
+                        )
+                        : nil
+                    // 选区扫描期间取消后不再进入后续光标行计算。
+                    guard !Task.isCancelled else { return (nil, nil) }
+                    // 只有大纲消费者存在时才扫描光标前缀。
+                    let line =
+                        needsLine
+                        ? MarkdownSourceLineMap.lineNumber(
+                            in: source,
+                            utf16Location: selection.location
+                        )
+                        : nil
+                    // 行扫描结束后再次拒绝已经取消的结果。
+                    guard !Task.isCancelled else { return (nil, nil) }
+                    // 一次返回两个独立可选结果。
+                    return (line, selectedCharacterCount)
+                }
+                // 外层选区任务取消时显式传播给不继承取消状态的 detached 扫描。
+                let result = await withTaskCancellationHandler {
+                    // 正常路径等待本次光标行和选区统计完成。
+                    await scanTask.value
+                } onCancel: {
+                    // 标签切换、连续选区变化或视图销毁会停止可取消扫描。
+                    scanTask.cancel()
+                }
+                // 再次确认任务仍是最新活动标签结果。
                 guard !Task.isCancelled, self?.parent.isActive == true else { return }
-                // 使用协调器最新回调通知当前活动视图。
-                self?.parent.onSelectionLineChanged?(line)
+                // 使用协调器最新回调发布当前光标行。
+                if let line = result.0 {
+                    self?.parent.onSelectionLineChanged?(line)
+                }
+                // 使用协调器最新回调发布当前选区字符数。
+                if let selectedCharacterCount = result.1 {
+                    self?.parent.onSelectedCharacterCountChanged?(selectedCharacterCount)
+                }
             }
         }
 
@@ -1111,6 +1167,10 @@ struct NativeTextEditor: NSViewRepresentable {
         context.coordinator.configureHighlighting(textView: textView, scrollView: scrollView)
         // 注册活动编辑器供标题栏、菜单和大纲使用。
         NativeEditorActions.register(textView, documentID: documentID, isActive: isActive)
+        // 首次创建活动编辑器时发布初始光标行和零选区统计。
+        if isActive {
+            context.coordinator.scheduleSelectionUpdate(for: textView, delayNanoseconds: 0)
+        }
         // 新建标签的视图进入窗口后自动接收键盘输入。
         if isActive {
             DispatchQueue.main.async {
@@ -1156,6 +1216,8 @@ struct NativeTextEditor: NSViewRepresentable {
                 editedRange: textView.selectedRange(),
                 delayNanoseconds: 0
             )
+            // 切回标签时恢复这个 NSTextView 自己保留的真实选区统计。
+            context.coordinator.scheduleSelectionUpdate(for: textView, delayNanoseconds: 0)
         }
         // 字号、行距或开关变化时立即刷新当前高亮范围。
         if highlightingPreferencesChanged {

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-v0.10.x 是 Markdown Lite 当前支持的公开 Beta。安全修复优先进入[默认分支和最新标记版本](https://github.com/nemoob/markdown-lite-mac)；v0.1.x 至 v0.9.x 不承诺回补。建议先在最新代码上确认问题仍然存在。
+v0.11.x 是当前维护线；公开支持版本以 [GitHub Releases](https://github.com/nemoob/markdown-lite-mac/releases) 中最新 prerelease 为准，更早公开版本不承诺回补。安全修复优先进入默认分支和下一次发布，建议先在最新代码上确认问题仍然存在。
 
 ## Reporting a vulnerability
 

@@ -55,7 +55,12 @@ final class WorkspaceModel: ObservableObject {
     // 标签数组顺序直接对应界面标签顺序。
     @Published private(set) var documents: [EditorModel] = []
     // 活动 UUID 独立持久化，避免使用易变化的数组下标。
-    @Published private(set) var activeDocumentID: UUID?
+    @Published private(set) var activeDocumentID: UUID? {
+        didSet {
+            // 活动身份变化后立即停止后台标签预览，并启动新活动标签最新正文。
+            synchronizePreviewActivity()
+        }
+    }
     // 最近文件由工作区统一提供给打开菜单。
     @Published private(set) var recentDocuments: [RecentDocument] = []
     // 会话或打开失败时提供非破坏性反馈。
@@ -109,6 +114,15 @@ final class WorkspaceModel: ObservableObject {
         }
         // 会话损坏时仍可显示首个有效标签。
         return documents.first
+    }
+
+    // 把唯一活动身份同步给现有标签，避免恢复多个大文档时并行解析。
+    private func synchronizePreviewActivity() {
+        // 每个模型只比较 UUID，不复制正文或重建编辑器对象。
+        for document in documents {
+            // 精确活动标签获得自动预览资格，其他标签立即取消后台任务。
+            document.setPreviewActive(document.id == activeDocumentID)
+        }
     }
 
     // 创建独立未命名标签并设为活动。
