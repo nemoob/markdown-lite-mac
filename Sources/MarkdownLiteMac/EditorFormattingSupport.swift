@@ -146,7 +146,7 @@ enum MarkdownListContinuationSupport {
         // 读取首个标记字符区分无序和有序列表。
         let first = content.character(at: cursor)
 
-        // 无序列表只接受 Markdown Lite 已支持的三种标记。
+        // 无序列表只接受墨简已支持的三种标记。
         if first == 45 || first == 42 || first == 43 {
             // 跳过单字符无序标记。
             cursor += 1

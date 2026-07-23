@@ -1,10 +1,16 @@
 # Changelog
 
-本文件记录 Markdown Lite 的用户可见变化。版本号遵循 [Semantic Versioning](https://semver.org/)。
+本文件记录墨简（Mojian）的用户可见变化。版本号遵循 [Semantic Versioning](https://semver.org/)。
 
-> 发布状态：0.7.0 至 0.10.0 章节是未创建 tag 或 GitHub Release 的开发检查点；公开版本只以 [GitHub Releases](https://github.com/nemoob/markdown-lite-mac/releases) 为准。
+> 发布状态：0.7.0 至 0.10.0 章节是未创建 tag 或 GitHub Release 的开发检查点；公开版本只以 [GitHub Releases](https://github.com/nemoob/mojian-editor/releases) 为准。
 
 ## [Unreleased]
+
+### Changed
+
+- 产品由 Markdown Lite 更名为墨简（Mojian），GitHub 仓库迁移至 `nemoob/mojian-editor`。
+- 当前仓库只维护 macOS Swift 版本；Windows 与 Linux 如开始开发，将分别使用 `nemoob/mojian-editor-window` 和 `nemoob/mojian-editor-linux`。
+- 本地应用包改为 `Mojian.app`，同时保留既有 Bundle ID、Swift target 和 `Application Support/MarkdownLiteMac` 数据路径，确保旧版本设置、草稿、会话与单实例锁继续兼容。
 
 ## [0.11.0] - 2026-07-23
 

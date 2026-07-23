@@ -500,12 +500,12 @@ struct MarkdownLiteMacApp: App {
             // 已运行实例提供直接结论，其他故障说明数据保护原因。
             if error as? ApplicationInstanceLockError == .alreadyRunning {
                 // 第二实例不创建工作区，也不会触碰草稿或会话。
-                alert.messageText = "Markdown Lite 已在运行"
+                alert.messageText = "墨简已在运行"
                 // 引导用户回到首实例继续编辑。
-                alert.informativeText = "为避免多个进程同时写入恢复数据，本次启动已取消。请切换到已经打开的 Markdown Lite。"
+                alert.informativeText = "为避免多个进程同时写入恢复数据，本次启动已取消。请切换到已经打开的墨简。"
             } else {
                 // 无法确认互斥时按数据安全优先级关闭式失败。
-                alert.messageText = "无法安全启动 Markdown Lite"
+                alert.messageText = "无法安全启动墨简"
                 // 计算固定恢复目录，只展示应用元数据位置而不暴露任何正文。
                 let storageDirectory = WorkspaceSessionStore.defaultRootDirectory(
                     fileManager: .default

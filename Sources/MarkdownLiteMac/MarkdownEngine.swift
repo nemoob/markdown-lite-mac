@@ -386,7 +386,7 @@ enum EnhancedMarkdownParser {
     private static func trimLeadingSpaces(_ line: Substring) -> Substring {
         // 从原切片开始移动左边界。
         var result = line
-        // Markdown Lite 首版宽容任意常见缩进。
+        // 墨简首版宽容任意常见缩进。
         while !Task.isCancelled, let first = result.first, first == " " || first == "\t" {
             // 丢弃首个缩进字符。
             result = result.dropFirst()

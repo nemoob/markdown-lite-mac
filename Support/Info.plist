@@ -5,7 +5,7 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleDisplayName</key>
-    <string>Markdown Lite</string>
+    <string>墨简</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
@@ -37,7 +37,7 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Markdown Lite</string>
+    <string>墨简</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

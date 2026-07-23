@@ -28,6 +28,18 @@ mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFTPM_MODULECACHE_OVERRIDE"
 bash -n "$PROJECT_DIR/Scripts/check.sh" "$PROJECT_DIR/Scripts/package-app.sh"
 # 应用元数据必须保持合法 plist。
 plutil -lint "$PROJECT_DIR/Support/Info.plist"
+# 公开显示名必须与当前产品品牌一致。
+PLIST_DISPLAY_NAME="$(plutil -extract CFBundleDisplayName raw -o - "$PROJECT_DIR/Support/Info.plist")"
+# 品牌误回退时立即阻断提交。
+[[ "$PLIST_DISPLAY_NAME" == "墨简" ]] || { echo "CFBundleDisplayName 必须为墨简" >&2; exit 1; }
+# SwiftPM 可执行名称作为当前稳定技术标识继续保留。
+PLIST_EXECUTABLE="$(plutil -extract CFBundleExecutable raw -o - "$PROJECT_DIR/Support/Info.plist")"
+# 打包脚本与 plist 不一致会生成无法启动的应用包。
+[[ "$PLIST_EXECUTABLE" == "MarkdownLiteMac" ]] || { echo "CFBundleExecutable 兼容标识发生变化" >&2; exit 1; }
+# 读取沿用 v0.11 的应用身份，防止设置和系统关联被意外切换。
+PLIST_BUNDLE_IDENTIFIER="$(plutil -extract CFBundleIdentifier raw -o - "$PROJECT_DIR/Support/Info.plist")"
+# Bundle ID 迁移需要独立的数据迁移方案，不能混入普通品牌修改。
+[[ "$PLIST_BUNDLE_IDENTIFIER" == "cn.nemoob.markdown-lite-mac" ]] || { echo "CFBundleIdentifier 兼容标识发生变化" >&2; exit 1; }
 # 严格格式门禁禁止只输出告警却继续成功。
 swift format lint --strict --recursive \
     "$PROJECT_DIR/Sources" \
