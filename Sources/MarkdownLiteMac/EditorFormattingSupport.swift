@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 // 定义菜单和快捷键可以调用的 Markdown 原生格式操作。
@@ -24,6 +25,566 @@ struct MarkdownFormattingEdit: Equatable, Sendable {
     let replacement: String
     // 替换完成后需要恢复的 UTF-16 选区。
     let selectionAfterEdit: NSRange
+}
+
+// 为原生 Return 生成一次最小列表替换，不依赖异步预览或完整 Markdown 解析。
+enum MarkdownListContinuationSupport {
+    // 围栏外一次搜索两种候选字符，避免为 1MB 正文做两遍子串查找。
+    private static let fenceMarkerCharacters = CharacterSet(charactersIn: "`~")
+
+    // 保存代码围栏的字符和最短闭合长度。
+    private struct Fence {
+        // 反引号与波浪号必须使用相同字符闭合。
+        let marker: unichar
+        // 闭合围栏不能短于起始围栏。
+        let length: Int
+    }
+
+    // 保存当前列表行的下一项前缀和正文范围。
+    private struct ParsedListLine {
+        // 新行复用缩进、标记风格和分隔空白。
+        let continuationPrefix: String
+        // 正文范围用于识别再次回车即可退出的空项。
+        let bodyRange: NSRange
+    }
+
+    // 为纯逻辑调用方桥接 Swift String，并复用不复制 NSTextStorage 的核心入口。
+    static func edit(in source: String, selection: NSRange) -> MarkdownFormattingEdit? {
+        // 测试与非视图调用方使用不可变 NSString 快照。
+        edit(in: source as NSString, selection: selection)
+    }
+
+    // 在单一折叠选区上直接读取原生字符串并生成续写或退出列表计划。
+    static func edit(in content: NSString, selection: NSRange) -> MarkdownFormattingEdit? {
+        // 智能 Return 只接管一个有效光标，多字符选区保持系统替换行为。
+        guard selection.location != NSNotFound,
+            selection.length == 0,
+            selection.location <= content.length,
+            content.length > 0
+        else { return nil }
+        // 光标落在 UTF-16 代理项中间不是 NSTextView 可安全替换的字符边界。
+        guard !splitsSurrogatePair(in: content, at: selection.location) else { return nil }
+
+        // 取得光标所在逻辑行的内容边界和原始换行边界。
+        var lineStart = 0
+        // 完整行终点包含 LF、CRLF 或 CR。
+        var lineEnd = 0
+        // 内容终点排除原始换行符。
+        var contentsEnd = 0
+        // Foundation 负责处理混合换行与 UTF-16 光标坐标。
+        content.getLineStart(
+            &lineStart,
+            end: &lineEnd,
+            contentsEnd: &contentsEnd,
+            for: NSRange(location: selection.location, length: 0)
+        )
+        // 位于换行符内部的异常光标不应触发自定义替换。
+        guard selection.location >= lineStart, selection.location <= contentsEnd else { return nil }
+        // 围栏内的列表样例属于代码，必须保持普通 Return。
+        guard !isInsideFence(in: content, before: lineStart) else { return nil }
+        // 只解析当前行前缀，不运行全文块解析器。
+        guard
+            let parsed = parsedListLine(
+                in: content,
+                lineRange: NSRange(location: lineStart, length: contentsEnd - lineStart)
+            )
+        else { return nil }
+        // 光标必须已经越过列表或任务标记，避免在标记内部拆行。
+        guard selection.location >= parsed.bodyRange.location else { return nil }
+
+        // 整个列表正文为空白时移除当前标记，让本行退出列表结构。
+        if containsOnlyHorizontalSpace(in: content, range: parsed.bodyRange) {
+            // 一次替换移除缩进、标记和尾随空白，但保留既有换行符。
+            return MarkdownFormattingEdit(
+                replacementRange: NSRange(location: lineStart, length: contentsEnd - lineStart),
+                replacement: "",
+                selectionAfterEdit: NSRange(location: lineStart, length: 0)
+            )
+        }
+
+        // 优先复用当前行换行，文末则继承上一行风格并最终回退 LF。
+        let lineBreak = preferredLineBreak(
+            in: content,
+            lineStart: lineStart,
+            lineEnd: lineEnd,
+            contentsEnd: contentsEnd
+        )
+        // 换行与下一项标记在一次输入中完成，保证单步撤销。
+        let replacement = lineBreak + parsed.continuationPrefix
+        // 新光标落在下一项正文起点，行中 Return 会把右侧正文自然移到这里。
+        let selectionAfterEdit = NSRange(
+            location: selection.location + (replacement as NSString).length,
+            length: 0
+        )
+        // 只在原光标插入，不改动前后列表编号或其他行。
+        return MarkdownFormattingEdit(
+            replacementRange: selection,
+            replacement: replacement,
+            selectionAfterEdit: selectionAfterEdit
+        )
+    }
+
+    // 解析无序、有序及其任务变体，并生成下一项前缀。
+    private static func parsedListLine(in content: NSString, lineRange: NSRange) -> ParsedListLine? {
+        // 空行不包含可续写的列表标记。
+        guard lineRange.length > 0 else { return nil }
+        // `- - -` 与 `* * *` 属于预览分割线，不能按列表续写。
+        guard !isDivider(in: content, range: lineRange) else { return nil }
+        // 行终点用于所有字符访问的统一上界。
+        let lineLimit = NSMaxRange(lineRange)
+        // 从行首开始保留全部空格和制表符缩进。
+        var cursor = lineRange.location
+        // 列表解析器与预览层一致地接受常见横向缩进。
+        while cursor < lineLimit, isHorizontalSpace(content.character(at: cursor)) {
+            // 每轮只消费一个 UTF-16 ASCII 空白单元。
+            cursor += 1
+        }
+        // 只有缩进而没有标记时回退普通 Return。
+        guard cursor < lineLimit else { return nil }
+        // 保存缩进终点，供有序列表替换新编号时复用。
+        let markerStart = cursor
+        // 读取首个标记字符区分无序和有序列表。
+        let first = content.character(at: cursor)
+
+        // 无序列表只接受 Markdown Lite 已支持的三种标记。
+        if first == 45 || first == 42 || first == 43 {
+            // 跳过单字符无序标记。
+            cursor += 1
+            // 标记后至少需要一个空格或制表符。
+            guard cursor < lineLimit, isHorizontalSpace(content.character(at: cursor)) else { return nil }
+            // 预览解析器只消费一个分隔字符，其余空白属于真实正文。
+            cursor += 1
+            // 无序续行复用缩进、标记和第一个原始分隔字符。
+            let basePrefix = content.substring(
+                with: NSRange(location: lineRange.location, length: cursor - lineRange.location)
+            )
+            // 统一解析可选任务标记，并把已完成状态重置为未完成。
+            return taskAwareLine(
+                in: content,
+                basePrefix: basePrefix,
+                bodyStart: cursor,
+                lineLimit: lineLimit
+            )
+        }
+
+        // 有序列表必须从一个或多个 ASCII 数字开始。
+        guard isASCIIDigit(first) else { return nil }
+        // 扫描连续数字并保留原分隔符风格。
+        while cursor < lineLimit, isASCIIDigit(content.character(at: cursor)) {
+            // 每次只前进一个 ASCII 数字。
+            cursor += 1
+        }
+        // 数字后必须存在点号或右括号。
+        guard cursor < lineLimit else { return nil }
+        // 保存真实结束符，下一项继续使用同一风格。
+        let delimiter = content.character(at: cursor)
+        // 其他字符不能构成有序列表标记。
+        guard delimiter == 46 || delimiter == 41 else { return nil }
+        // 把原编号转换为 Int，超大数字安全回退系统行为。
+        let numberText = content.substring(
+            with: NSRange(location: markerStart, length: cursor - markerStart)
+        )
+        // Int.max 无法生成下一项，必须拒绝溢出。
+        guard let number = Int(numberText), number < Int.max else { return nil }
+        // 跳过点号或右括号。
+        cursor += 1
+        // 结束符后至少需要一个空格或制表符。
+        guard cursor < lineLimit, isHorizontalSpace(content.character(at: cursor)) else { return nil }
+        // 记录编号后分隔空白起点。
+        let gapStart = cursor
+        // 预览解析器只消费第一个分隔字符。
+        cursor += 1
+        // 原缩进不随新编号位数变化。
+        let indentation = content.substring(
+            with: NSRange(location: lineRange.location, length: markerStart - lineRange.location)
+        )
+        // 点号或右括号按原样复用。
+        let delimiterText = content.substring(with: NSRange(location: gapStart - 1, length: 1))
+        // 编号后的第一个空白按原样复用。
+        let gap = content.substring(with: NSRange(location: gapStart, length: 1))
+        // 只计算当前下一项，不重写前后编号。
+        let basePrefix = indentation + String(number + 1) + delimiterText + gap
+        // 有序任务同样把下一项固定为未完成。
+        return taskAwareLine(
+            in: content,
+            basePrefix: basePrefix,
+            bodyStart: cursor,
+            lineLimit: lineLimit
+        )
+    }
+
+    // 在列表正文起点识别可选任务标记，并保留任务后的分隔空白。
+    private static func taskAwareLine(
+        in content: NSString,
+        basePrefix: String,
+        bodyStart: Int,
+        lineLimit: Int
+    ) -> ParsedListLine {
+        // 任务标记至少需要左括号、状态、右括号和一个 ASCII 空格。
+        guard bodyStart + 3 < lineLimit,
+            content.character(at: bodyStart) == 91,
+            isTaskState(content.character(at: bodyStart + 1)),
+            content.character(at: bodyStart + 2) == 93,
+            content.character(at: bodyStart + 3) == 32
+        else {
+            // 普通列表正文直接使用标记后的当前位置。
+            return ParsedListLine(
+                continuationPrefix: basePrefix,
+                bodyRange: NSRange(location: bodyStart, length: lineLimit - bodyStart)
+            )
+        }
+        // 与预览解析器一致地只跳过右括号后的一个 ASCII 空格。
+        let cursor = bodyStart + 4
+        // 下一项无论当前 x 大小写或完成状态都固定为未完成。
+        let continuationPrefix = basePrefix + "[ ] "
+        // 返回真实任务正文范围供空项退出判断。
+        return ParsedListLine(
+            continuationPrefix: continuationPrefix,
+            bodyRange: NSRange(location: cursor, length: lineLimit - cursor)
+        )
+    }
+
+    // 按 MarkdownEngine 同口径识别允许空白分隔的分割线。
+    private static func isDivider(in content: NSString, range: NSRange) -> Bool {
+        // 去掉行首横向空白后定位首个标记。
+        var cursor = skippingHorizontalSpace(in: content, from: range.location, limit: NSMaxRange(range))
+        // 只有空白的行不是分割线。
+        guard cursor < NSMaxRange(range) else { return false }
+        // 保存整行必须统一使用的标记字符。
+        let marker = content.character(at: cursor)
+        // Markdown 分割线只接受减号、星号或下划线。
+        guard marker == 45 || marker == 42 || marker == 95 else { return false }
+        // 统计忽略空白后的真实标记数量。
+        var markerCount = 0
+        // 扫描当前逻辑行全部内容。
+        while cursor < NSMaxRange(range) {
+            // 读取一个 ASCII 标记或横向空白。
+            let character = content.character(at: cursor)
+            // 相同标记计入分割线长度。
+            if character == marker {
+                // 累加真实标记数量。
+                markerCount += 1
+            } else if !isHorizontalSpace(character) {
+                // 任一其他字符都证明这是普通列表正文。
+                return false
+            }
+            // 继续检查下一 UTF-16 单元。
+            cursor += 1
+        }
+        // 标准分割线至少需要三个相同标记。
+        return markerCount >= 3
+    }
+
+    // 扫描当前行之前的围栏状态，避免在代码示例内改写 Return。
+    private static func isInsideFence(in content: NSString, before lineStart: Int) -> Bool {
+        // 文首之前不可能已经进入代码围栏。
+        guard lineStart > 0 else { return false }
+        // nil 表示当前扫描位置位于普通 Markdown。
+        var activeFence: Fence?
+        // 从文首候选围栏推进，普通正文通过 NSString 原生搜索一次跳过。
+        var cursor = 0
+        // 当前行本身不参与判断，避免列表正文被误当成围栏声明。
+        while cursor < lineStart {
+            // 围栏外同时寻找两种标记，围栏内只寻找可能闭合的同类标记。
+            guard
+                let candidate = nextFenceCandidate(
+                    in: content,
+                    from: cursor,
+                    before: lineStart,
+                    marker: activeFence?.marker
+                )
+            else {
+                // 没有更多候选时，现有活动状态就是当前行所属上下文。
+                return activeFence != nil
+            }
+            // 取得候选所在行的真实起点。
+            var scannedLineStart = 0
+            // 取得候选所在行的完整行终点。
+            var scannedLineEnd = 0
+            // 内容终点排除本行换行符。
+            var scannedContentsEnd = 0
+            // 每个围栏候选最多调用一次 Foundation 行边界识别。
+            content.getLineStart(
+                &scannedLineStart,
+                end: &scannedLineEnd,
+                contentsEnd: &scannedContentsEnd,
+                for: NSRange(location: candidate, length: 0)
+            )
+            // 防御异常范围越过目标当前行。
+            let boundedContentsEnd = min(scannedContentsEnd, lineStart)
+            // 保存本次不含换行的扫描范围。
+            let scannedRange = NSRange(
+                location: scannedLineStart,
+                length: max(0, boundedContentsEnd - scannedLineStart)
+            )
+            // 已进入围栏时只接受匹配字符且足够长的纯围栏闭合行。
+            if let fence = activeFence {
+                // 匹配闭合后恢复普通 Markdown 状态。
+                if isClosingFence(in: content, range: scannedRange, opening: fence) {
+                    // 清除活动围栏供后续行重新识别。
+                    activeFence = nil
+                }
+            } else if let opening = openingFence(in: content, range: scannedRange) {
+                // 普通状态遇到合法起始行后保存围栏约束。
+                activeFence = opening
+            }
+            // 异常零长度行至少越过本次候选，避免搜索停留在原位置。
+            let nextCursor = max(candidate + 3, scannedLineEnd)
+            // 最多推进到当前目标行起点。
+            cursor = min(nextCursor, lineStart)
+        }
+        // 仍有活动围栏表示当前列表样文本属于代码内容。
+        return activeFence != nil
+    }
+
+    // 用 NSString 原生子串搜索定位下一个可能改变围栏状态的位置。
+    private static func nextFenceCandidate(
+        in content: NSString,
+        from start: Int,
+        before limit: Int,
+        marker: unichar?
+    ) -> Int? {
+        // 空搜索范围没有任何候选。
+        guard start < limit else { return nil }
+        // 所有搜索都限制在当前列表行之前。
+        let searchRange = NSRange(location: start, length: limit - start)
+        // 已进入围栏时其他字符不可能闭合当前块。
+        if let marker {
+            // 根据活动字符选择固定三字符搜索令牌。
+            let token = marker == 96 ? "```" : "~~~"
+            // Foundation 在 UTF-16 范围内使用优化后的原生查找。
+            let match = content.range(of: token, options: [.literal], range: searchRange)
+            // NSNotFound 明确表示直到当前行都没有闭合候选。
+            return match.location == NSNotFound ? nil : match.location
+        }
+        // 普通 Markdown 一次寻找任意反引号或波浪号字符。
+        let match = content.rangeOfCharacter(
+            from: fenceMarkerCharacters,
+            options: [],
+            range: searchRange
+        )
+        // 找不到候选时无需逐行扫描全文。
+        return match.location == NSNotFound ? nil : match.location
+    }
+
+    // 解析一行开头的反引号或波浪号围栏。
+    private static func openingFence(in content: NSString, range: NSRange) -> Fence? {
+        // 去掉允许存在的前导横向空白。
+        var cursor = skippingHorizontalSpace(in: content, from: range.location, limit: NSMaxRange(range))
+        // 空行不能开启代码围栏。
+        guard cursor < NSMaxRange(range) else { return nil }
+        // 只接受反引号或波浪号。
+        let marker = content.character(at: cursor)
+        // 其他首字符保持普通 Markdown 状态。
+        guard marker == 96 || marker == 126 else { return nil }
+        // 统计连续相同围栏字符。
+        let markerStart = cursor
+        // 起始信息串不影响围栏长度。
+        while cursor < NSMaxRange(range), content.character(at: cursor) == marker {
+            // 每轮消费一个围栏字符。
+            cursor += 1
+        }
+        // GFM 风格围栏至少需要三个字符。
+        let length = cursor - markerStart
+        // 过短标记按普通正文处理。
+        guard length >= 3 else { return nil }
+        // 返回闭合时需要匹配的字符与长度。
+        return Fence(marker: marker, length: length)
+    }
+
+    // 判断一行是否为当前围栏的合法闭合行。
+    private static func isClosingFence(
+        in content: NSString,
+        range: NSRange,
+        opening: Fence
+    ) -> Bool {
+        // 闭合围栏同样允许前导横向空白。
+        var cursor = skippingHorizontalSpace(in: content, from: range.location, limit: NSMaxRange(range))
+        // 首字符必须与起始围栏一致。
+        guard cursor < NSMaxRange(range), content.character(at: cursor) == opening.marker else { return false }
+        // 保存闭合围栏字符起点。
+        let markerStart = cursor
+        // 统计连续相同字符。
+        while cursor < NSMaxRange(range), content.character(at: cursor) == opening.marker {
+            // 每轮消费一个闭合字符。
+            cursor += 1
+        }
+        // 闭合长度不能短于起始围栏。
+        guard cursor - markerStart >= opening.length else { return false }
+        // 闭合围栏后只允许空格或制表符。
+        return skippingHorizontalSpace(in: content, from: cursor, limit: NSMaxRange(range))
+            == NSMaxRange(range)
+    }
+
+    // 根据当前或上一行选择不改变文档风格的换行符。
+    private static func preferredLineBreak(
+        in content: NSString,
+        lineStart: Int,
+        lineEnd: Int,
+        contentsEnd: Int
+    ) -> String {
+        // 当前行已有换行时精确复用其 LF、CRLF 或 CR 字节语义。
+        if lineEnd > contentsEnd {
+            // 直接读取 Foundation 已识别的换行范围。
+            return content.substring(
+                with: NSRange(location: contentsEnd, length: lineEnd - contentsEnd)
+            )
+        }
+        // 文末行没有换行时优先检查上一行终止字符。
+        if lineStart > 0 {
+            // 上一 UTF-16 单元是 LF 时可能属于 CRLF。
+            if content.character(at: lineStart - 1) == 10 {
+                // 同时存在 CR 时保持双字符换行。
+                if lineStart > 1, content.character(at: lineStart - 2) == 13 {
+                    // 返回原文使用的 CRLF。
+                    return "\r\n"
+                }
+                // 单独 LF 保持 Unix 换行。
+                return "\n"
+            }
+            // 单独 CR 保持旧式换行风格。
+            if content.character(at: lineStart - 1) == 13 {
+                // 返回原文使用的 CR。
+                return "\r"
+            }
+        }
+        // 全文第一行且没有现有换行时采用平台通用 LF。
+        return "\n"
+    }
+
+    // 跳过指定范围开头的空格和制表符。
+    private static func skippingHorizontalSpace(in content: NSString, from start: Int, limit: Int) -> Int {
+        // 从调用方提供的安全起点开始。
+        var cursor = start
+        // 逐个跳过 ASCII 横向空白。
+        while cursor < limit, isHorizontalSpace(content.character(at: cursor)) {
+            // 推进到首个非空白字符或范围末尾。
+            cursor += 1
+        }
+        // 返回首个未消费位置。
+        return cursor
+    }
+
+    // 判断范围是否只含空格或制表符。
+    private static func containsOnlyHorizontalSpace(in content: NSString, range: NSRange) -> Bool {
+        // 从正文范围起点开始扫描。
+        var cursor = range.location
+        // 任一非横向空白都表示列表项已有正文。
+        while cursor < NSMaxRange(range) {
+            // 非空白字符立即结束判断。
+            if !isHorizontalSpace(content.character(at: cursor)) { return false }
+            // 继续检查下一 UTF-16 单元。
+            cursor += 1
+        }
+        // 空范围或全空白范围都属于可退出列表的空项。
+        return true
+    }
+
+    // 判断 UTF-16 光标是否错误地位于一对代理项之间。
+    private static func splitsSurrogatePair(in content: NSString, at location: Int) -> Bool {
+        // 文首和文末都是合法边界，不读取范围外字符。
+        guard location > 0, location < content.length else { return false }
+        // 读取光标左侧 UTF-16 单元。
+        let previous = content.character(at: location - 1)
+        // 读取光标右侧 UTF-16 单元。
+        let next = content.character(at: location)
+        // 高代理项后紧跟低代理项时，二者中间不是 Unicode 字符边界。
+        return previous >= 0xD800 && previous <= 0xDBFF
+            && next >= 0xDC00 && next <= 0xDFFF
+    }
+
+    // 只把 ASCII 空格和制表符视为 Markdown 标记分隔。
+    private static func isHorizontalSpace(_ character: unichar) -> Bool {
+        // 数值判断避免为单字符创建临时 String。
+        character == 32 || character == 9
+    }
+
+    // 有序列表编号严格限制为 ASCII 0 到 9。
+    private static func isASCIIDigit(_ character: unichar) -> Bool {
+        // 连续码点范围可以常量时间判断。
+        character >= 48 && character <= 57
+    }
+
+    // 任务状态只接受空格、小写 x 或大写 X。
+    private static func isTaskState(_ character: unichar) -> Bool {
+        // 与预览任务解析规则保持一致。
+        character == 32 || character == 120 || character == 88
+    }
+}
+
+// 在 release 自检中复核 1MB 文档智能 Return 的真实计划耗时。
+enum MarkdownListContinuationSelfCheck {
+    // 保存可在日志和 CI 中直接复核的分位数与最慢值。
+    struct Report: Sendable {
+        // 第 95 百分位反映连续回车的稳定延迟。
+        let p95Milliseconds: Double
+        // 最慢一次用于捕捉明显调度或算法尖峰。
+        let maximumMilliseconds: Double
+    }
+
+    // 执行固定 1MB 样本并可选择严格应用性能门槛。
+    static func run(iterations: Int = 100, enforcePerformanceTargets: Bool = true) -> Report {
+        // 至少执行一次，避免空数组无法计算分位数。
+        let safeIterations = max(1, iterations)
+        // 长普通块与少量行内标记共同覆盖快速搜索和候选排除分支。
+        let ordinaryLine = "普通正文 0123456789\n"
+        // 每约 16KB 插入一次非围栏反引号与波浪号，贴近日常技术文档。
+        let unit = String(repeating: ordinaryLine, count: 512) + "行内 `code` 与 ~ 符号\n"
+        // 按 UTF-8 字节数构造不小于 1MB 的稳定样本。
+        let repetitions = 1_048_576 / unit.utf8.count + 1
+        // 文末真实无序项是每轮需要生成编辑计划的目标。
+        let source = String(repeating: unit, count: repetitions) + "- 最后一项"
+        // 自检计时直接复用不可变 NSString，排除无关桥接分配。
+        let nativeContent = source as NSString
+        // 文末 UTF-16 光标与正式 NSTextView 坐标一致。
+        let selection = NSRange(location: nativeContent.length, length: 0)
+        // 首次调用预热 Foundation 行边界和代码路径。
+        let warmup = MarkdownListContinuationSupport.edit(in: nativeContent, selection: selection)
+        // 功能结果错误时性能数字没有意义，立即终止自检。
+        precondition(warmup?.replacement == "\n- ", "智能列表 1MB 预热结果错误")
+        // 预分配固定次数，避免计时循环中的数组扩容噪声。
+        var measurements = [Double]()
+        // 提前保留全部测量容量。
+        measurements.reserveCapacity(safeIterations)
+
+        // 每轮独立测量同一纯计划，结果不修改样本文本。
+        for _ in 0..<safeIterations {
+            // 单调纳秒时钟不受系统时间调整影响。
+            let start = DispatchTime.now().uptimeNanoseconds
+            // 正式计算必须始终返回同一下一项前缀。
+            let edit = MarkdownListContinuationSupport.edit(in: nativeContent, selection: selection)
+            // 在结果产生后立即截取终点，避免断言和数组操作进入计时。
+            let end = DispatchTime.now().uptimeNanoseconds
+            // 任一轮功能退化都应让自检失败。
+            precondition(edit?.replacement == "\n- ", "智能列表 1MB 计划结果错误")
+            // 将纳秒差转换为便于阅读的毫秒。
+            measurements.append(Double(end - start) / 1_000_000)
+        }
+
+        // 排序后用固定索引计算可复核的第 95 百分位。
+        let sorted = measurements.sorted()
+        // 向上取整确保小样本也不会低估尾部延迟。
+        let p95Index = min(sorted.count - 1, max(0, Int(ceil(Double(sorted.count) * 0.95)) - 1))
+        // 保存本轮稳定分位数与真实最慢值。
+        let report = Report(
+            p95Milliseconds: sorted[p95Index],
+            maximumMilliseconds: sorted[sorted.count - 1]
+        )
+        // 严格 release 自检执行跨本机与共享 CI 都稳定的尾延迟门槛。
+        if enforcePerformanceTargets {
+            // 任一门槛失败时输出精确实测值方便定位回归。
+            precondition(
+                report.p95Milliseconds < 10 && report.maximumMilliseconds < 25,
+                String(
+                    format: "智能列表 1MB 性能未达标：p95 %.2fms，max %.2fms",
+                    report.p95Milliseconds,
+                    report.maximumMilliseconds
+                )
+            )
+        }
+        // 返回报告供命令行自检输出。
+        return report
+    }
 }
 
 // 以纯逻辑生成格式化编辑，便于覆盖 Unicode 和可逆性自检。

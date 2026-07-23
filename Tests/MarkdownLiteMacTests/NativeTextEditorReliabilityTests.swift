@@ -241,6 +241,211 @@ struct NativeTextEditorReliabilityTests {
         #expect(textView.string == "前言\n- [x] 当前任务\n结尾")
     }
 
+    // 任务项回车必须续写未完成项，并且一次撤销重做完整往返。
+    @Test("任务列表智能回车单步撤销")
+    func testTaskContinuationUsesSingleNativeUndoStep() throws {
+        // 创建真实窗口级撤销管理器供 NSTextView 注册输入动作。
+        let window = makeWindow()
+        // 使用生产子类覆盖真实 Return 路由。
+        let textView = makeMarkdownTextView(text: "- [x] 已完成")
+        // 文本视图进入响应者链后才能获得窗口撤销管理器。
+        window.contentView?.addSubview(textView)
+        // 模型盒子验证原生替换仍通过 delegate 回写 SwiftUI 绑定。
+        let modelText = TextBox(textView.string)
+        // 正式协调器负责文本变化、撤销和重做通知。
+        let coordinator = makeCoordinator(text: modelText)
+        // 测试结束时停止本次输入可能安排的后台任务。
+        defer { coordinator.tearDown() }
+        // 生产子类继续使用正式协调器作为文本代理。
+        textView.delegate = coordinator
+        // 首屏正文已与模型一致，避免回车后被误判为外部整体换文。
+        coordinator.recordInitialText(modelText.value)
+        // 当前文本视图成为第一响应者，匹配真实键盘输入。
+        window.makeFirstResponder(textView)
+        // 光标放在已完成任务末尾。
+        let originalEnd = (textView.string as NSString).length
+        // 零长选区允许智能回车接管。
+        textView.setSelectedRange(NSRange(location: originalEnd, length: 0))
+        // 取得与应用窗口一致的共享撤销管理器。
+        let undoManager = try #require(window.undoManager)
+        // 无事件循环测试显式建立一次 Return 对应的撤销分组。
+        undoManager.beginUndoGrouping()
+        // 调用生产 NSTextView 子类的原生回车入口。
+        textView.insertNewline(nil)
+        // 关闭唯一撤销组，以便立即执行 undo。
+        undoManager.endUndoGrouping()
+
+        // 新任务固定为未完成，不继承上一项的 x。
+        let continuedText = "- [x] 已完成\n- [ ] "
+        // 原生正文必须一次插入换行和新标记。
+        #expect(textView.string == continuedText)
+        // delegate 同步路径必须产生与原生视图完全一致的模型正文。
+        #expect(modelText.value == continuedText)
+        // 光标应落在新任务标记之后便于继续输入。
+        #expect(
+            textView.selectedRange()
+                == NSRange(location: (continuedText as NSString).length, length: 0))
+
+        // 一次撤销必须完整移除换行和任务标记。
+        undoManager.undo()
+        // 撤销后回到原始已完成任务。
+        #expect(textView.string == "- [x] 已完成")
+        // 无事件循环测试显式发送 AppKit 在真实菜单撤销中产生的文本变化通知。
+        textView.didChangeText()
+        // delegate 必须把撤销结果同步回模型供 dirty 精确校准。
+        #expect(modelText.value == "- [x] 已完成")
+        // 一次重做必须恢复整个智能回车结果。
+        undoManager.redo()
+        // 重做后再次得到未完成的新任务。
+        #expect(textView.string == continuedText)
+        // 无事件循环测试同样显式发送真实菜单重做对应的通知。
+        textView.didChangeText()
+        // 重做结果同样必须同步回模型。
+        #expect(modelText.value == continuedText)
+    }
+
+    // 只有列表标记的空项回车应退出列表，不产生新的空任务。
+    @Test("空任务回车退出列表")
+    func testEmptyTaskReturnExitsList() throws {
+        // 创建可撤销的真实窗口和智能文本视图。
+        let window = makeWindow()
+        // 第二行是没有正文的未完成任务。
+        let textView = makeMarkdownTextView(text: "- 第一项\n- [ ] ")
+        // 视图进入窗口以使用正式撤销响应者链。
+        window.contentView?.addSubview(textView)
+        // 输入焦点指向待退出的当前任务。
+        window.makeFirstResponder(textView)
+        // 光标位于空任务标记末尾。
+        textView.setSelectedRange(
+            NSRange(location: (textView.string as NSString).length, length: 0))
+        // 取得窗口撤销管理器以显式包住本次 Return。
+        let undoManager = try #require(window.undoManager)
+        // 开始单独智能回车动作。
+        undoManager.beginUndoGrouping()
+        // 走生产子类空项退出路径。
+        textView.insertNewline(nil)
+        // 关闭本次撤销分组。
+        undoManager.endUndoGrouping()
+
+        // 空任务标记应被移除，但前一项和既有换行完整保留。
+        #expect(textView.string == "- 第一项\n")
+        // 光标位于空白行开头，用户可以立即输入普通段落。
+        #expect(
+            textView.selectedRange()
+                == NSRange(location: ("- 第一项\n" as NSString).length, length: 0))
+    }
+
+    // 普通段落不命中列表 helper 时必须完整保留 NSTextView 默认回车。
+    @Test("普通段落回车使用系统行为")
+    func testPlainParagraphReturnFallsBackToNativeBehavior() throws {
+        // 使用真实窗口验证 super.insertNewline 的 AppKit 行为。
+        let window = makeWindow()
+        // 普通段落不包含任何可续写的列表前缀。
+        let textView = makeMarkdownTextView(text: "普通正文")
+        // 将文本视图接入窗口输入和撤销链。
+        window.contentView?.addSubview(textView)
+        // 当前文本视图接收本次回车。
+        window.makeFirstResponder(textView)
+        // 光标放在普通段落末尾。
+        textView.setSelectedRange(
+            NSRange(location: (textView.string as NSString).length, length: 0))
+        // 无事件循环测试仍需一个明确的撤销组。
+        let undoManager = try #require(window.undoManager)
+        // 开始普通原生回车动作。
+        undoManager.beginUndoGrouping()
+        // helper 返回 nil 后应调用 NSTextView 的原生实现。
+        textView.insertNewline(nil)
+        // 关闭普通回车撤销分组。
+        undoManager.endUndoGrouping()
+
+        // 默认回车只在光标处插入一个换行符。
+        #expect(textView.string == "普通正文\n")
+        // 光标位于新行起点，不包含任何 Markdown 前缀。
+        #expect(
+            textView.selectedRange()
+                == NSRange(location: ("普通正文\n" as NSString).length, length: 0))
+    }
+
+    // 非折叠选区必须由 NSTextView 原生替换，不能套用列表续写语义。
+    @Test("列表中的文本选区回车使用系统行为")
+    func testSelectedListTextReturnFallsBackToNativeBehavior() throws {
+        // 创建真实窗口和生产文本视图。
+        let window = makeWindow()
+        // 正文看似列表，但选中文字使智能 helper 不应接管。
+        let textView = makeMarkdownTextView(text: "- 当前项目")
+        // 视图进入窗口后获得原生输入与撤销链。
+        window.contentView?.addSubview(textView)
+        // 模型盒子验证 super.insertNewline 仍正常回写绑定。
+        let modelText = TextBox(textView.string)
+        // 正式协调器连接原生正文和模型。
+        let coordinator = makeCoordinator(text: modelText)
+        // 测试结束前停止后台任务。
+        defer { coordinator.tearDown() }
+        // 所有文本变化走生产 delegate。
+        textView.delegate = coordinator
+        // 初始正文已经与模型一致。
+        coordinator.recordInitialText(modelText.value)
+        // 当前文本视图获得键盘焦点。
+        window.makeFirstResponder(textView)
+        // 选择列表正文而不是放置折叠光标。
+        textView.setSelectedRange(NSRange(location: 2, length: ("当前项目" as NSString).length))
+        // 明确建立一次原生 Return 撤销组。
+        let undoManager = try #require(window.undoManager)
+        // 开始系统替换动作。
+        undoManager.beginUndoGrouping()
+        // 生产入口应因非折叠选区调用 super。
+        textView.insertNewline(nil)
+        // 结束系统替换动作。
+        undoManager.endUndoGrouping()
+
+        // 原生行为只用换行替换选中文字，不续写第二个列表标记。
+        #expect(textView.string == "- \n")
+        // delegate 正常把系统回退结果同步回模型。
+        #expect(modelText.value == "- \n")
+    }
+
+    // 同一窗口中的两个文档必须各自处理 Return，不能串写后台标签。
+    @Test("智能回车只修改目标文档")
+    func testListContinuationKeepsOtherDocumentUntouched() throws {
+        // 复用单窗口多标签相同的共享响应者链。
+        let window = makeWindow()
+        // 前台文档包含待续写的无序列表。
+        let firstTextView = makeMarkdownTextView(text: "- 前台项")
+        // 后台文档使用另一份独立 textStorage。
+        let secondTextView = makeMarkdownTextView(text: "- 后台项")
+        // 前台视图进入共享窗口。
+        window.contentView?.addSubview(firstTextView)
+        // 后台视图同时保留在层级中，匹配应用的标签 ZStack。
+        window.contentView?.addSubview(secondTextView)
+        // 此次键盘输入明确指向前台文档。
+        window.makeFirstResponder(firstTextView)
+        // 前台光标放在列表项末尾。
+        firstTextView.setSelectedRange(
+            NSRange(location: (firstTextView.string as NSString).length, length: 0))
+        // 后台光标位置单独设置，但不应被前台 Return 读取或修改。
+        secondTextView.setSelectedRange(
+            NSRange(location: (secondTextView.string as NSString).length, length: 0))
+        // 共享窗口管理本次前台输入撤销。
+        let undoManager = try #require(window.undoManager)
+        // 开始唯一的前台 Return 分组。
+        undoManager.beginUndoGrouping()
+        // 直接调用前台视图的生产回车入口。
+        firstTextView.insertNewline(nil)
+        // 结束前台撤销分组。
+        undoManager.endUndoGrouping()
+
+        // 前台列表正常续写相同标记。
+        #expect(firstTextView.string == "- 前台项\n- ")
+        // 后台正文完全不变，证明 Return 没有通过全局注册表串写。
+        #expect(secondTextView.string == "- 后台项")
+        // 撤销只恢复前台文档。
+        undoManager.undo()
+        // 前台正文回到回车前。
+        #expect(firstTextView.string == "- 前台项")
+        // 后台文档在撤销后仍然不变。
+        #expect(secondTextView.string == "- 后台项")
+    }
+
     // 直接修改 NSTextStorage 后发送 NSTextView 正式文本变化通知。
     private func replaceTextStorage(of textView: NSTextView, with text: String) {
         // NSTextStorage setter 不经过用户输入撤销注册，适合隔离测试 delegate 来源判断。
@@ -282,6 +487,19 @@ struct NativeTextEditorReliabilityTests {
         // 写入不进入撤销栈的测试初始正文。
         textView.string = text
         // 返回可挂到共享窗口的原生编辑器。
+        return textView
+    }
+
+    // 创建生产 Markdown NSTextView 子类，用于覆盖 Return 路由的原生集成测试。
+    private func makeMarkdownTextView(text: String) -> MarkdownNativeTextView {
+        // 每个视图使用独立 textStorage，与多标签生产结构一致。
+        let textView = MarkdownNativeTextView(
+            frame: NSRect(x: 0, y: 0, width: 220, height: 140))
+        // 开启 NSTextView 原生撤销注册，验证智能回车的单步语义。
+        textView.allowsUndo = true
+        // 初始正文直接写入，不把测试准备当成用户撤销动作。
+        textView.string = text
+        // 返回可挂入共享测试窗口的真实生产子类。
         return textView
     }
 

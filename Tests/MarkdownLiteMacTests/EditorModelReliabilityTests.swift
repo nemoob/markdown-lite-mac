@@ -219,6 +219,112 @@ struct EditorModelReliabilityTests {
         #expect(blocks.isEmpty)
     }
 
+    // 会话恢复必须向用户明确标记草稿来自上一代，而不是普通当前代。
+    @Test("上一代草稿恢复状态可见")
+    @MainActor
+    func testRestoreReportsPreviousDraftSource() throws {
+        // 建立只承载本次双代草稿的隔离目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理本次唯一目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 创建正式草稿存储和稳定未命名标签身份。
+        let store = DocumentSupportStore(rootDirectory: root)
+        // 固定 UUID 让 current 和 previous 始终命中同一恢复槽位。
+        let documentID = UUID()
+        // 第一份有效正文将在第二次保存后成为上一代。
+        _ = try store.saveDraft("上一代正文", for: nil, untitledID: documentID)
+        // 第二份正文建立 current/previous 双代布局。
+        _ = try store.saveDraft("即将损坏的当前正文", for: nil, untitledID: documentID)
+        // 复用生产键算法定位本测试 current 文件。
+        let draftKey = try store.draftKey(for: nil, untitledID: documentID)
+        // current 仍使用兼容 v0.7 的固定 JSON 地址。
+        let currentURL =
+            root
+            .appendingPathComponent("Drafts", isDirectory: true)
+            .appendingPathComponent("\(draftKey).json", isDirectory: false)
+        // 注入截断 JSON，强制恢复路径使用有效 previous。
+        try Data("{".utf8).write(to: currentURL, options: [.atomic])
+        // 构造与真实会话相同的未命名标签描述。
+        let descriptor = WorkspaceSessionDocument(id: documentID, fileURL: nil)
+
+        // 通过正式静态恢复入口创建编辑模型。
+        let restored = try #require(EditorModel.restore(descriptor, documentStore: store))
+        // 无论断言结果如何都停止恢复模型的预览任务。
+        defer { restored.prepareForClose() }
+        // 正文必须来自同一标签的有效上一代。
+        #expect(restored.text == "上一代正文")
+        // 上一代仍是未写入真实文件的恢复正文。
+        #expect(restored.isDirty)
+        // 状态必须把上一代来源明确展示给用户。
+        #expect(restored.status == "已从上一代草稿恢复")
+    }
+
+    // 双代都损坏时编辑器必须保持受保护状态，不能把空白误判为安全正文。
+    @Test("双代草稿损坏时保留证据并阻止安全误判")
+    @MainActor
+    func testRestoreKeepsCorruptDraftEvidenceProtected() throws {
+        // 建立只承载本次故障注入的隔离目录。
+        let root = try makeTemporaryDirectory()
+        // 测试结束后只清理本次唯一目录。
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 创建正式草稿存储和稳定未命名标签身份。
+        let store = DocumentSupportStore(rootDirectory: root)
+        // 固定 UUID 让两次保存形成同一文档双代。
+        let documentID = UUID()
+        // 连续保存两次建立 current 和 previous。
+        _ = try store.saveDraft("上一代", for: nil, untitledID: documentID)
+        // 第二次保存完成双代布局。
+        _ = try store.saveDraft("当前代", for: nil, untitledID: documentID)
+        // 复用生产键算法定位两代精确文件。
+        let draftKey = try store.draftKey(for: nil, untitledID: documentID)
+        // 草稿目录与生产布局一致。
+        let draftsDirectory = root.appendingPathComponent("Drafts", isDirectory: true)
+        // current 保持旧版兼容路径。
+        let currentURL = draftsDirectory.appendingPathComponent("\(draftKey).json", isDirectory: false)
+        // previous 使用固定单代回退路径。
+        let previousURL = draftsDirectory.appendingPathComponent(
+            "\(draftKey).previous.json",
+            isDirectory: false
+        )
+        // 为两代写入不同损坏证据。
+        let currentEvidence = Data("{损坏-current".utf8)
+        // previous 使用不同字节证明后续没有发生轮换。
+        let previousEvidence = Data("{损坏-previous".utf8)
+        // 破坏 current。
+        try currentEvidence.write(to: currentURL, options: [.atomic])
+        // 同时破坏 previous。
+        try previousEvidence.write(to: previousURL, options: [.atomic])
+        // 构造真实会话恢复描述。
+        let descriptor = WorkspaceSessionDocument(id: documentID, fileURL: nil)
+
+        // 正式恢复入口仍要返回可见的安全编辑状态。
+        let restored = try #require(EditorModel.restore(descriptor, documentStore: store))
+        // 无论断言结果如何都停止恢复模型的预览任务。
+        defer { restored.prepareForClose() }
+        // 无法证明任何正文有效时只展示空白，不返回损坏内容。
+        #expect(restored.text.isEmpty)
+        // 标签必须保持 dirty，避免关闭流程自动删除两代证据。
+        #expect(restored.isDirty)
+        // 状态必须明确告知恢复失败且证据仍在本地。
+        #expect(restored.status == "草稿恢复失败，损坏数据已保留")
+        // 模拟普通输入后又通过撤销回到恢复时的空正文。
+        restored.text = "临时输入"
+        // 撤销结果与保存快照相同，但独立恢复失败仍未解决。
+        restored.text = ""
+        // 原生编辑器在撤销完成后调用正式 dirty 校准入口。
+        restored.reconcileDirtyAfterUndoRedo()
+        // 撤销不能把双代失败误判为干净标签。
+        #expect(restored.isDirty)
+        // 状态必须继续提示损坏证据仍保留。
+        #expect(restored.status == "草稿恢复失败，损坏数据仍保留")
+        // 同步安全草稿写入必须失败，退出保护据此阻止静默关闭。
+        #expect(!restored.ensureRecoverableDraft())
+        // current 损坏字节必须保持原样。
+        #expect(try Data(contentsOf: currentURL) == currentEvidence)
+        // previous 损坏字节也必须保持原样。
+        #expect(try Data(contentsOf: previousURL) == previousEvidence)
+    }
+
     // 为每个测试创建唯一目录，避免并行执行时互相覆盖。
     private func makeTemporaryDirectory() throws -> URL {
         // 使用系统临时目录和随机 UUID 构造明确范围。

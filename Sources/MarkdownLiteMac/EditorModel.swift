@@ -47,6 +47,14 @@ final class EditorModel: ObservableObject, Identifiable {
     @Published private(set) var status: String
     // 当前标签最近一次有效预览耗时。
     @Published private(set) var renderMilliseconds = 0.0
+    // 自动预览暂停时保存可展示原因，手动刷新成功后恢复正常耗时展示。
+    @Published private(set) var previewPauseReason: PreviewWorkPauseReason?
+    // 当前标签的全文与选区统计由后台任务计算，状态栏只读取常量时间结果。
+    @Published private(set) var writingStatistics = WritingStatistics(
+        characterCount: 0,
+        lineCount: 1,
+        selectedCharacterCount: 0
+    )
     // 标签标题使用真实文件名或稳定未命名标题。
     @Published private(set) var filename: String
     // dirty 只表示当前标签尚未写回真实文件。
@@ -81,6 +89,12 @@ final class EditorModel: ObservableObject, Identifiable {
     private var isReplacingDocument = false
     // 每个标签持有自己的后台预览任务。
     private var previewTask: Task<Void, Never>?
+    // 只有工作区活动标签允许启动自动预览和写作统计任务。
+    private var isPreviewActive = true
+    // 写作统计与预览分开取消，较慢的全文计数不能覆盖新正文。
+    private var writingStatisticsTask: Task<Void, Never>?
+    // 每次正文变化推进统计代次，保证只接受最新结果。
+    private var writingStatisticsGeneration = 0
     // 每个标签独立递增版本，过期结果不会跨标签回写。
     private var previewGeneration = 0
     // 保存当前 previewBlocks 实际对应的正文代次，供交互预览拒绝旧动作。
@@ -91,6 +105,8 @@ final class EditorModel: ObservableObject, Identifiable {
     private var draftWriteTask: Task<Void, Never>?
     // HTML 图片读取、编码和原子写入使用独立后台任务，避免阻塞编辑输入。
     private var exportTask: Task<Void, Never>?
+    // 双代草稿都不可用时保持独立保护，普通撤销不能把损坏证据当作旧草稿清理。
+    private var hasUnresolvedDraftRecoveryFailure: Bool
 
     // 保留旧调用方式，实际应用由 WorkspaceModel 注入共享存储。
     convenience init() {
@@ -133,6 +149,7 @@ final class EditorModel: ObservableObject, Identifiable {
         documentStore: DocumentSupportStore,
         externalFileSnapshot: ExternalFileSnapshot? = nil,
         initialExternalChangeState: ExternalDocumentChangeState? = nil,
+        unresolvedDraftRecoveryFailure: Bool = false,
         recordRecentDocument: ((URL) throws -> Void)? = nil
     ) {
         // 先保存稳定标签身份。
@@ -145,6 +162,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 // 默认路径保持既有存储实现和排序语义。
                 try documentStore.recordRecentDocument(fileURL)
             }
+        // 恢复失败保护独立于普通 dirty 快照，直到正文安全落盘或用户明确丢弃。
+        hasUnresolvedDraftRecoveryFailure = unresolvedDraftRecoveryFailure
         // 初始化正文，不触发 didSet。
         self.text = text
         // 先用局部值规范化真实文件路径，避免初始化期间读取 self。
@@ -196,6 +215,8 @@ final class EditorModel: ObservableObject, Identifiable {
         self.status = status
         // 首屏预览也离开主线程，避免会话恢复多个大文件时卡住窗口。
         schedulePreview(after: .zero)
+        // 首屏统计同样在后台执行，初始化不能同步遍历大正文。
+        scheduleWritingStatistics(after: .zero)
     }
 
     // 将草稿捕获时的摘要恢复成仅用于内容比较的可信磁盘基线。
@@ -281,8 +302,29 @@ final class EditorModel: ObservableObject, Identifiable {
     ) -> EditorModel? {
         // 未命名标签按 UUID 精确恢复自己的草稿。
         guard let fileURL = descriptor.fileURL else {
-            // 草稿损坏时回退空标签，不能让整个会话崩溃。
-            let draft = try? documentStore.loadDraft(for: nil, untitledID: descriptor.id)
+            // 预留带来源的草稿结果，便于向用户说明上一代回退。
+            var draftLoad: DraftLoadResult?
+            // 单独记录双代恢复失败，避免把空标签误标成可安全关闭。
+            var draftRecoveryFailed = false
+            do {
+                // 未命名草稿必须继续按标签 UUID 严格隔离。
+                draftLoad = try documentStore.loadDraftWithRecoverySource(
+                    for: nil,
+                    untitledID: descriptor.id
+                )
+            } catch {
+                // 存储层保留损坏证据，模型只进入受保护的空白编辑状态。
+                draftRecoveryFailed = true
+            }
+            // 后续恢复逻辑只消费已经通过身份校验的草稿。
+            let draft = draftLoad?.draft
+            // 恢复状态明确区分正常、上一代回退和双代失败。
+            let restoredStatus =
+                draftRecoveryFailed
+                ? "草稿恢复失败，损坏数据已保留"
+                : draftLoad?.recoveredFromPrevious == true
+                    ? "已从上一代草稿恢复"
+                    : draft == nil ? "已恢复空白标签" : "已恢复草稿"
             // 草稿存在即表示尚未写入真实文件。
             return EditorModel(
                 id: descriptor.id,
@@ -290,12 +332,13 @@ final class EditorModel: ObservableObject, Identifiable {
                 fileURL: nil,
                 encoding: draft?.encoding ?? .utf8,
                 includesByteOrderMark: draft?.includesByteOrderMark ?? false,
-                dirty: draft != nil,
+                dirty: draft != nil || draftRecoveryFailed,
                 savedText: "",
                 savedEncoding: .utf8,
                 savedIncludesByteOrderMark: false,
-                status: draft == nil ? "已恢复空白标签" : "已恢复草稿",
-                documentStore: documentStore
+                status: restoredStatus,
+                documentStore: documentStore,
+                unresolvedDraftRecoveryFailure: draftRecoveryFailed
             )
         }
 
@@ -303,10 +346,21 @@ final class EditorModel: ObservableObject, Identifiable {
         let diskRead = try? TextFileIO.readWithSnapshot(from: fileURL)
         // 后续恢复逻辑只消费无损解码正文。
         let diskContent = diskRead?.content
-        // 已命名草稿仍按规范化路径定位。
-        let draft = try? documentStore.loadDraft(for: fileURL)
+        // 预留带来源的已命名草稿结果，便于反馈上一代回退。
+        var draftLoad: DraftLoadResult?
+        // 双代都不可用时仍保留磁盘正文和损坏草稿证据。
+        var draftRecoveryFailed = false
+        do {
+            // 已命名草稿继续按规范化路径和内嵌身份双重校验。
+            draftLoad = try documentStore.loadDraftWithRecoverySource(for: fileURL)
+        } catch {
+            // 恢复失败不让整个会话崩溃，也不能把标签当成干净状态自动清理草稿。
+            draftRecoveryFailed = true
+        }
+        // 后续恢复逻辑只使用已经验证的草稿。
+        let draft = draftLoad?.draft
         // 文件失效且没有草稿时跳过这个标签。
-        guard diskContent != nil || draft != nil else { return nil }
+        guard diskContent != nil || draft != nil || draftRecoveryFailed else { return nil }
         // 草稿与磁盘不同时优先恢复草稿，避免会话恢复阶段弹出多次警告。
         let shouldRestoreDraft = draft != nil && draft?.text != diskContent?.text
         // 选择安全的当前正文。
@@ -346,11 +400,25 @@ final class EditorModel: ObservableObject, Identifiable {
             ?? (diskRead == nil ? .deleted : .unchanged)
         // 冲突恢复需要直接提示外部版本风险，不能只显示普通草稿恢复。
         let restoredStatus =
-            diskContent == nil
-            ? "原文件失效，已恢复草稿"
-            : shouldRestoreDraft && restoredExternalState == .modified
-                ? "已恢复草稿，检测到磁盘版本已在外部修改"
-                : shouldRestoreDraft ? "已恢复草稿" : "已恢复文件"
+            draftRecoveryFailed
+            ? diskContent == nil
+                ? "原文件失效且草稿恢复失败，损坏数据已保留"
+                : "草稿恢复失败，已打开磁盘文件并保留损坏数据"
+            : diskContent == nil
+                ? draftLoad?.recoveredFromPrevious == true
+                    ? "原文件失效，已从上一代草稿恢复"
+                    : "原文件失效，已恢复草稿"
+                : shouldRestoreDraft && restoredExternalState == .modified
+                    ? draftLoad?.recoveredFromPrevious == true
+                        ? "已从上一代草稿恢复，检测到磁盘版本已在外部修改"
+                        : "已恢复草稿，检测到磁盘版本已在外部修改"
+                    : shouldRestoreDraft
+                        ? draftLoad?.recoveredFromPrevious == true
+                            ? "已从上一代草稿恢复"
+                            : "已恢复草稿"
+                        : draftLoad?.recoveredFromPrevious == true
+                            ? "已从上一代草稿核对，磁盘文件未变化"
+                            : "已恢复文件"
         // 返回完整独立标签模型。
         return EditorModel(
             id: descriptor.id,
@@ -358,14 +426,15 @@ final class EditorModel: ObservableObject, Identifiable {
             fileURL: fileURL,
             encoding: restoredEncoding,
             includesByteOrderMark: restoredBOM,
-            dirty: shouldRestoreDraft || diskContent == nil,
+            dirty: shouldRestoreDraft || diskContent == nil || draftRecoveryFailed,
             savedText: savedText,
             savedEncoding: diskContent?.encoding ?? restoredEncoding,
             savedIncludesByteOrderMark: diskContent?.includesByteOrderMark ?? restoredBOM,
             status: restoredStatus,
             documentStore: documentStore,
             externalFileSnapshot: restoredSnapshot,
-            initialExternalChangeState: restoredExternalState
+            initialExternalChangeState: restoredExternalState,
+            unresolvedDraftRecoveryFailure: draftRecoveryFailed
         )
     }
 
@@ -379,8 +448,10 @@ final class EditorModel: ObservableObject, Identifiable {
         let diskRead = try TextFileIO.readWithSnapshot(from: fileURL)
         // 后续草稿选择逻辑消费同一份正文。
         let diskContent = diskRead.content
-        // 再读取这个路径自己的恢复草稿。
-        let draft = try documentStore.loadDraft(for: fileURL)
+        // 再读取这个路径自己的恢复草稿并保留实际采用的代次。
+        let draftLoad = try documentStore.loadDraftWithRecoverySource(for: fileURL)
+        // 后续选择逻辑只消费已经通过身份校验的草稿。
+        let draft = draftLoad?.draft
         // 默认使用磁盘内容。
         var restoredDraft: DocumentDraft?
         // 内容不同必须让用户明确选择，不能静默丢弃任一版本。
@@ -389,8 +460,11 @@ final class EditorModel: ObservableObject, Identifiable {
             let alert = NSAlert()
             // 明确问题标题。
             alert.messageText = "发现未合并的恢复草稿"
-            // 明确恢复语义。
-            alert.informativeText = "草稿与磁盘文件内容不同。恢复草稿不会立即覆盖磁盘文件。"
+            // 上一代回退需要明确说明当前代不可用，同时保持不覆盖磁盘的既有语义。
+            alert.informativeText =
+                draftLoad?.recoveredFromPrevious == true
+                ? "当前草稿不可用，已找到同一文档的上一代草稿。恢复不会立即覆盖磁盘文件。"
+                : "草稿与磁盘文件内容不同。恢复草稿不会立即覆盖磁盘文件。"
             // 第一项保留草稿。
             alert.addButton(withTitle: "恢复草稿")
             // 第二项明确丢弃草稿。
@@ -444,8 +518,12 @@ final class EditorModel: ObservableObject, Identifiable {
             restoredDraft == nil
             ? "文件已打开"
             : restoredExternalState == .modified
-                ? "已恢复草稿，检测到磁盘版本已在外部修改"
-                : "已恢复草稿，磁盘版本尚未覆盖"
+                ? draftLoad?.recoveredFromPrevious == true
+                    ? "已从上一代草稿恢复，检测到磁盘版本已在外部修改"
+                    : "已恢复草稿，检测到磁盘版本已在外部修改"
+                : draftLoad?.recoveredFromPrevious == true
+                    ? "已从上一代草稿恢复，磁盘版本尚未覆盖"
+                    : "已恢复草稿，磁盘版本尚未覆盖"
         // 创建独立文件标签。
         return EditorModel(
             id: id,
@@ -480,6 +558,8 @@ final class EditorModel: ObservableObject, Identifiable {
         isDirty = true
         // 当前标签停顿 120ms 后在后台解析。
         schedulePreview(after: .milliseconds(120))
+        // 同一停顿窗口合并全文统计，避免逐键重复扫描。
+        scheduleWritingStatistics(after: .milliseconds(120))
         // 当前标签旧草稿任务已经过期。
         draftTimer?.invalidate()
         // 取消上一轮仅用于状态回写的后台任务。
@@ -496,7 +576,18 @@ final class EditorModel: ObservableObject, Identifiable {
     // 原生编辑器只在撤销或重做完成后调用，用完整保存快照精确修正 dirty 状态。
     func reconcileDirtyAfterUndoRedo() {
         // 普通输入仍走常量时间 markChanged；这里仅为撤销栈回到保存内容的低频路径做全文核对。
-        isDirty = saveState.reconcile(text: text, fileURL: currentFileURL)
+        let reconciledDirty = saveState.reconcile(text: text, fileURL: currentFileURL)
+        // 双代失败未解决前，即使正文撤销回磁盘快照也不能自动删除损坏证据。
+        guard !hasUnresolvedDraftRecoveryFailure else {
+            // 保持 dirty 让关闭和退出流程继续要求明确保存或丢弃。
+            isDirty = true
+            // 撤销后的状态栏重新展示仍未解决的数据恢复风险。
+            status = "草稿恢复失败，损坏数据仍保留"
+            // 不能进入普通干净路径的计时器取消和草稿删除。
+            return
+        }
+        // 没有独立恢复风险时沿用保存快照精确修正 dirty。
+        isDirty = reconciledDirty
         // 仍与保存快照不同时保留当前草稿节流和恢复能力。
         guard !isDirty else { return }
         // 回到保存快照后停止尚未触发的草稿计时器。
@@ -552,6 +643,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 )
                 // 新输入取消后不允许旧任务覆盖状态栏。
                 guard !Task.isCancelled else { return }
+                // 成功写入新的有效 current 后，双代失败保护已经得到解决。
+                self?.hasUnresolvedDraftRecoveryFailure = false
                 // 模型仍存活时反馈草稿已经落盘。
                 self?.status = "已自动保存草稿"
             } catch {
@@ -564,15 +657,29 @@ final class EditorModel: ObservableObject, Identifiable {
     }
 
     // 在后台解析当前标签，只接受最新一代结果。
-    private func schedulePreview(after delay: Duration) {
+    private func schedulePreview(
+        after delay: Duration,
+        trigger: PreviewWorkTrigger = .automatic
+    ) {
         // 取消当前标签尚未开始的旧任务。
         previewTask?.cancel()
         // 当前标签版本号独立递增。
         previewGeneration &+= 1
         // 捕获本次版本用于回写核对。
         let generation = previewGeneration
+        // 后台标签的自动请求直接结束，连正文快照和字节统计都不创建。
+        if trigger == .automatic, !isPreviewActive {
+            // 保存稳定原因供测试和后续激活时识别当前状态。
+            previewPauseReason = .backgroundTab
+            // 后台标签等待激活入口重新安排最新正文。
+            return
+        }
         // String 写时复制提供低成本正文快照。
         let markdown = text
+        // 捕获活动状态，后台任务不得跨 actor 读取可变模型。
+        let capturedIsActive = isPreviewActive
+        // 新请求开始后先清除旧暂停原因，避免手动刷新期间仍显示暂停页。
+        previewPauseReason = nil
         // 外层任务负责节流和最新结果回写。
         previewTask = Task { [weak self] in
             do {
@@ -584,10 +691,24 @@ final class EditorModel: ObservableObject, Identifiable {
             }
             // 已取消任务不再消耗解析 CPU。
             guard !Task.isCancelled else { return }
-            // detached 任务让大文档解析离开主线程，并返回可由取消路径丢弃的可选结果。
-            let parseTask = Task.detached(priority: .userInitiated) { () -> ([EnhancedPreviewBlock], Double)? in
+            // detached 任务先在后台统计字节并执行策略，再按需解析正文。
+            let parseTask = Task.detached(priority: .userInitiated) {
+                () -> (PreviewWorkPauseReason?, [EnhancedPreviewBlock], Double)? in
                 // 外层任务在 detached 启动前取消时不进入解析器。
                 guard !Task.isCancelled else { return nil }
+                // UTF-8 计数可能遍历大正文，必须与输入主线程隔离。
+                let byteCount = markdown.utf8.count
+                // 统一策略决定后台、超大文档或手动请求能否继续。
+                let decision = PreviewWorkPolicy.decision(
+                    isActiveDocument: capturedIsActive,
+                    documentByteCount: byteCount,
+                    trigger: trigger
+                )
+                // 自动请求被暂停时不进入完整 Markdown 解析。
+                if let pauseReason = decision.pauseReason {
+                    // 只返回原因，不制造无意义的预览块。
+                    return (pauseReason, [], 0)
+                }
                 // 单调时钟记录本次真实解析耗时。
                 let startedAt = ProcessInfo.processInfo.systemUptime
                 // 线性扫描生成增强块。
@@ -596,8 +717,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 guard !Task.isCancelled else { return nil }
                 // 换算成毫秒供当前标签状态栏展示。
                 let milliseconds = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
-                // 一次返回块和耗时。
-                return (blocks, milliseconds)
+                // 一次返回无暂停标记、预览块和耗时。
+                return (nil, blocks, milliseconds)
             }
             // 外层节流任务取消时显式传播给不继承取消状态的 detached 解析任务。
             let result = await withTaskCancellationHandler {
@@ -611,12 +732,130 @@ final class EditorModel: ObservableObject, Identifiable {
             guard !Task.isCancelled, let result else { return }
             // 只有同一标签最新版本可以回写。
             guard let self, self.previewGeneration == generation else { return }
+            // 策略暂停时只发布原因，不能把空数组伪装成成功预览。
+            if let pauseReason = result.0 {
+                // 大文档提示由界面提供单次手动刷新入口。
+                self.previewPauseReason = pauseReason
+                // 暂停代次没有对应可交互预览。
+                return
+            }
+            // 成功解析清除之前的大文档暂停状态。
+            self.previewPauseReason = nil
             // 先标记结果所属代次，随后发布的块视图即可安全开放交互。
             self.appliedPreviewGeneration = generation
             // 更新当前标签预览块。
-            self.previewBlocks = result.0
+            self.previewBlocks = result.1
             // 更新当前标签解析耗时。
-            self.renderMilliseconds = result.1
+            self.renderMilliseconds = result.2
+        }
+    }
+
+    // 工作区在活动标签变化后同步每个模型的后台工作资格。
+    func setPreviewActive(_ isActive: Bool) {
+        // 相同状态不重复取消或重建任务。
+        guard isPreviewActive != isActive else { return }
+        // 先保存新状态供后续自动策略读取。
+        isPreviewActive = isActive
+        // 标签进入后台时立即停止未完成解析。
+        guard isActive else {
+            // 取消当前解析及其 detached 子任务。
+            previewTask?.cancel()
+            // 只有尚未追平的请求需要推进代次；已完成预览可安全跨标签复用。
+            if !isPreviewCurrent {
+                // 推进代次，防止恰好完成的旧结果回写。
+                previewGeneration &+= 1
+            }
+            // 后台原因不会在隐藏界面展示，但能准确描述当前策略状态。
+            previewPauseReason = .backgroundTab
+            // 后台标签不继续执行尚未完成的全文统计。
+            writingStatisticsTask?.cancel()
+            // 推进统计代次，防止取消边界上的旧结果回写。
+            writingStatisticsGeneration &+= 1
+            // 等待重新激活后再处理最新正文。
+            return
+        }
+        // 正文未变化且已有当前预览时直接复用，切换标签不重复解析。
+        if isPreviewCurrent {
+            // 清除仅用于后台状态的暂停原因。
+            previewPauseReason = nil
+        } else {
+            // 没有当前预览时立即为最新正文安排自动解析。
+            schedulePreview(after: .zero)
+        }
+        // 切回活动标签时同步追平最新全文统计。
+        scheduleWritingStatistics(after: .zero)
+    }
+
+    // 用户可为当前活动大文档显式执行一次不受大小限制的预览。
+    func refreshPreviewManually() {
+        // 后台标签没有可见预览入口，拒绝程序化误调用。
+        guard isPreviewActive else { return }
+        // 手动触发只放行当前请求，后续输入仍恢复自动大小限制。
+        schedulePreview(after: .zero, trigger: .manualRefresh)
+    }
+
+    // 原生编辑器把后台计算好的选区字符数回写到当前标签。
+    func updateSelectedCharacterCount(_ count: Int) {
+        // 防御外部误调用，状态栏不接受负数。
+        let safeCount = max(0, count)
+        // 相同结果不触发无意义的 SwiftUI 刷新。
+        guard writingStatistics.selectedCharacterCount != safeCount else { return }
+        // 保留已完成的全文统计，只替换当前选区结果。
+        writingStatistics = WritingStatistics(
+            characterCount: writingStatistics.characterCount,
+            lineCount: writingStatistics.lineCount,
+            selectedCharacterCount: safeCount
+        )
+    }
+
+    // 合并连续输入后在后台统计当前标签全文，只接受最新代次。
+    private func scheduleWritingStatistics(after delay: Duration) {
+        // 新正文或标签切换先取消旧统计等待。
+        writingStatisticsTask?.cancel()
+        // 每次请求推进独立代次。
+        writingStatisticsGeneration &+= 1
+        // 捕获代次供主线程回写前核对。
+        let generation = writingStatisticsGeneration
+        // 后台标签保留最近结果，激活时再为最新正文补算。
+        guard isPreviewActive else { return }
+        // String 写时复制只捕获当前正文，不在主线程遍历字符。
+        let source = text
+        // 外层任务负责节流、取消传播和最新结果回写。
+        writingStatisticsTask = Task { [weak self] in
+            do {
+                // 等待连续输入稳定。
+                try await ContinuousClock().sleep(for: delay)
+            } catch {
+                // 新输入或标签切换取消属于正常路径。
+                return
+            }
+            // 取消后不再创建全文统计任务。
+            guard !Task.isCancelled else { return }
+            // 字符和行扫描进入 utility 后台任务，避免影响输入响应。
+            let calculationTask = Task.detached(priority: .utility) {
+                // 选区由原生编辑器独立计算；全文扫描在任务取消时返回 nil。
+                WritingStatisticsSupport.calculateIfNotCancelled(in: source)
+            }
+            // 外层取消时显式传播给 detached 任务并丢弃其结果。
+            let result = await withTaskCancellationHandler {
+                // 正常路径等待纯统计完成。
+                await calculationTask.value
+            } onCancel: {
+                // 将取消传给周期检查状态的全文扫描，使旧快照尽快释放。
+                calculationTask.cancel()
+            }
+            // 仅同一标签最新代次可以更新状态栏。
+            guard !Task.isCancelled,
+                let self,
+                let result,
+                self.writingStatisticsGeneration == generation
+            else { return }
+            // 保留原生选区的最新结果，全文任务不能把它重置成零。
+            self.writingStatistics = WritingStatistics(
+                characterCount: result.characterCount,
+                lineCount: result.lineCount,
+                selectedCharacterCount: self.writingStatistics.selectedCharacterCount
+            )
         }
     }
 
@@ -633,6 +872,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 includesByteOrderMark: includesByteOrderMark,
                 baselineContentDigest: externalFileSnapshot?.contentDigest
             )
+            // 同步写入成功证明当前正文已有有效恢复入口。
+            hasUnresolvedDraftRecoveryFailure = false
             // 明确反馈草稿已经安全落盘。
             status = "已自动保存草稿"
             // 调用方可以安全切换或关闭。
@@ -866,6 +1107,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 encoding: diskRead.content.encoding,
                 includesByteOrderMark: diskRead.content.includesByteOrderMark
             )
+            // 用户明确采用磁盘版本后，旧草稿恢复失败不再阻止干净状态。
+            hasUnresolvedDraftRecoveryFailure = false
             // 发布干净状态。
             isDirty = false
             // 采用与本次正文严格匹配的磁盘快照。
@@ -880,6 +1123,10 @@ final class EditorModel: ObservableObject, Identifiable {
             try? documentStore.removeDraft(for: currentFileURL)
             // 立即刷新预览，不等待下一次输入。
             schedulePreview(after: .zero)
+            // 整体换文没有触发 contentChanged，先清除旧选区统计。
+            updateSelectedCharacterCount(0)
+            // 取消旧正文统计、推进代次并立即为磁盘新正文重新计算。
+            scheduleWritingStatistics(after: .zero)
             // 告知用户磁盘版本已安全采用。
             status = discardingChanges ? "已放弃当前编辑并重载磁盘版本" : "已重新载入磁盘版本"
             // 返回重载成功。
@@ -1024,6 +1271,8 @@ final class EditorModel: ObservableObject, Identifiable {
                 encoding: currentEncoding,
                 includesByteOrderMark: includesByteOrderMark
             )
+            // 正文成功写入真实文件后，旧恢复失败已经由明确保存解决。
+            hasUnresolvedDraftRecoveryFailure = false
             // 磁盘已经追平当前正文。
             isDirty = false
             // 保存实际写入字节对应的指纹供下一次冲突检查使用。
@@ -1169,6 +1418,8 @@ final class EditorModel: ObservableObject, Identifiable {
         draftWriteTask?.cancel()
         // 停止预览任务，避免无界面回写。
         previewTask?.cancel()
+        // 停止全文统计任务，关闭标签后不再发布状态栏结果。
+        writingStatisticsTask?.cancel()
         // 停止尚未完成的 HTML 图片读取和目标写入。
         exportTask?.cancel()
     }

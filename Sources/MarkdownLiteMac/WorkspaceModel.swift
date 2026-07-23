@@ -55,11 +55,20 @@ final class WorkspaceModel: ObservableObject {
     // 标签数组顺序直接对应界面标签顺序。
     @Published private(set) var documents: [EditorModel] = []
     // 活动 UUID 独立持久化，避免使用易变化的数组下标。
-    @Published private(set) var activeDocumentID: UUID?
+    @Published private(set) var activeDocumentID: UUID? {
+        didSet {
+            // 活动身份变化后立即停止后台标签预览，并启动新活动标签最新正文。
+            synchronizePreviewActivity()
+        }
+    }
     // 最近文件由工作区统一提供给打开菜单。
     @Published private(set) var recentDocuments: [RecentDocument] = []
     // 会话或打开失败时提供非破坏性反馈。
     @Published private(set) var status = "已就绪"
+    // 双代会话都无法恢复时持续发布显式状态，直到用户安全重建成功。
+    @Published private(set) var hasUnrecoverableSessionFailure = false
+    // 保存最近一次成功归档目录，横幅关闭后仍可由完成提示在 Finder 中定位。
+    @Published private(set) var lastSessionArchiveURL: URL?
 
     // 所有标签共享文档 IO 和草稿存储。
     private let documentStore: DocumentSupportStore
@@ -107,6 +116,15 @@ final class WorkspaceModel: ObservableObject {
         return documents.first
     }
 
+    // 把唯一活动身份同步给现有标签，避免恢复多个大文档时并行解析。
+    private func synchronizePreviewActivity() {
+        // 每个模型只比较 UUID，不复制正文或重建编辑器对象。
+        for document in documents {
+            // 精确活动标签获得自动预览资格，其他标签立即取消后台任务。
+            document.setPreviewActive(document.id == activeDocumentID)
+        }
+    }
+
     // 创建独立未命名标签并设为活动。
     func newDocument() {
         // 每次新建都生成新 UUID，不覆盖已有未命名草稿。
@@ -117,20 +135,21 @@ final class WorkspaceModel: ObservableObject {
         documents.append(document)
         // 新标签立即成为活动标签。
         activeDocumentID = document.id
-        // 原子保存新顺序和活动 UUID。
-        persistSession()
+        // 只有新顺序安全落盘后才能用成功文案覆盖会话错误。
+        guard persistSession() else { return }
         // 反馈新建完成。
         status = "已新建标签"
     }
 
     // 激活指定文档对象，不触发草稿写入或正文复制。
-    func activate(_ document: EditorModel) {
+    @discardableResult
+    func activate(_ document: EditorModel) -> Bool {
         // 只接受当前工作区实际持有的标签。
-        guard documents.contains(where: { $0.id == document.id }) else { return }
+        guard documents.contains(where: { $0.id == document.id }) else { return false }
         // 更新活动 UUID。
         activeDocumentID = document.id
         // 持久化下次启动活动标签。
-        persistSession()
+        return persistSession()
     }
 
     // 通过稳定 UUID 激活标签，便于 SwiftUI 按钮调用。
@@ -154,6 +173,57 @@ final class WorkspaceModel: ObservableObject {
         let nextIndex = (currentIndex + offset) % documents.count
         // 复用统一激活逻辑并持久化活动标签。
         activate(documents[nextIndex])
+    }
+
+    // 按稳定 UUID 把标签移到移除前数组的插入槽位。
+    @discardableResult
+    func moveDocument(id: UUID, to destinationIndex: Int) -> Bool {
+        // 插入槽位范围是 0...count；0 表示首标签前，count 表示末标签后。
+        guard destinationIndex >= 0, destinationIndex <= documents.count else { return false }
+        // 无效 UUID 不能改变顺序或触发会话写入。
+        guard let sourceIndex = documents.firstIndex(where: { $0.id == id }) else { return false }
+        // 源标签位于目标槽之前时，移除它会让实际插入下标左移一位。
+        let resolvedIndex = destinationIndex > sourceIndex ? destinationIndex - 1 : destinationIndex
+        // 源标签自身前后两个槽位都解析为原位，不得落盘。
+        guard resolvedIndex != sourceIndex else { return false }
+        // 在局部数组上完成重排，只复制引用而不重建编辑器对象。
+        var reorderedDocuments = documents
+        // 取出原 EditorModel 引用，保留正文、dirty、选区和撤销关联。
+        let movedDocument = reorderedDocuments.remove(at: sourceIndex)
+        // 把同一对象插入已校正的最终下标。
+        reorderedDocuments.insert(movedDocument, at: resolvedIndex)
+        // 一次发布最终顺序，避免 UI 观察到标签短暂缺失。
+        documents = reorderedDocuments
+        // 活动 UUID 保持不变；只有新顺序安全落盘才返回成功。
+        guard persistSession() else { return false }
+        // 发布可见成功反馈，但不覆盖任何文档级状态。
+        status = "标签已移动"
+        // 明确告知调用方重排和持久化均已完成。
+        return true
+    }
+
+    // 按最终位置偏移当前活动标签，UI 左移和右移分别传 -1 与 1。
+    @discardableResult
+    func moveActiveDocument(by offset: Int) -> Bool {
+        // 零偏移是明确原位操作，不能触发会话写入。
+        guard offset != 0 else { return false }
+        // 没有有效活动 UUID 时不猜测要移动的标签。
+        guard let activeDocumentID,
+            let sourceIndex = documents.firstIndex(where: { $0.id == activeDocumentID })
+        else { return false }
+        // 使用溢出检查计算最终下标，任意外部偏移都不能崩溃。
+        let targetCalculation = sourceIndex.addingReportingOverflow(offset)
+        // 溢出或越过首尾时保持原顺序且不落盘。
+        guard !targetCalculation.overflow,
+            documents.indices.contains(targetCalculation.partialValue)
+        else { return false }
+        // 目标在右侧时传其后方槽位，抵消源标签移除造成的左移。
+        let destinationIndex =
+            targetCalculation.partialValue > sourceIndex
+            ? targetCalculation.partialValue + 1
+            : targetCalculation.partialValue
+        // 复用 UUID 入口的对象保留、持久化和失败反馈逻辑。
+        return moveDocument(id: activeDocumentID, to: destinationIndex)
     }
 
     // 关闭指定标签；dirty 标签必须保存或安全落草稿。
@@ -248,8 +318,8 @@ final class WorkspaceModel: ObservableObject {
             // 新空白标签成为活动。
             activeDocumentID = replacement.id
         }
-        // 原子保存关闭后的顺序。
-        persistSession()
+        // 只有关闭后的顺序安全落盘后才能展示成功文案。
+        guard persistSession() else { return }
         // 反馈关闭完成。
         status = "标签已关闭"
     }
@@ -302,7 +372,10 @@ final class WorkspaceModel: ObservableObject {
             // 相同路径已打开时只激活已有标签。
             if let existing = documents.first(where: { $0.currentFileURL == url }) {
                 // 保留原对象、正文、撤销关联和预览任务。
-                activate(existing)
+                guard activate(existing) else {
+                    // 会话失败状态由 activate 内部 persistSession 保留。
+                    continue
+                }
                 // 最近访问顺序仍应更新。
                 try? recordRecentDocument(url)
                 // 刷新菜单。
@@ -346,8 +419,8 @@ final class WorkspaceModel: ObservableObject {
             }
             // 无论索引写入是否成功都重新读取菜单状态。
             refreshRecentDocuments()
-            // 无论索引写入是否成功都保存新增标签和活动 UUID。
-            persistSession()
+            // 只有新增标签身份安全落盘后才能用打开成功文案覆盖会话错误。
+            guard persistSession() else { continue }
             // 明确区分完整成功与最近文件辅助索引失败。
             status = recentDocumentWasUpdated ? "文件已打开" : "文件已打开，最近文件更新失败"
         }
@@ -401,6 +474,66 @@ final class WorkspaceModel: ObservableObject {
         return allDraftsSaved && sessionSaved
     }
 
+    // 在 Finder 中定位仍保留的损坏会话代，便于用户先备份或人工检查。
+    func revealSessionRecoveryData() {
+        // 优先选择实际存在的 current 和 previous 文件，让证据直接可见。
+        let generationURLs = sessionStore.existingGenerationURLs
+        // 两代文件都不存在时退回显示会话目录，避免按钮无响应。
+        let revealedURLs = generationURLs.isEmpty ? [sessionStore.storageDirectoryURL] : generationURLs
+        // 使用系统 Finder 同时选择全部可用恢复入口。
+        NSWorkspace.shared.activateFileViewerSelecting(revealedURLs)
+    }
+
+    // 在 Finder 中定位最近一次成功归档，供完成提示继续提供可达入口。
+    func revealLastSessionArchive() {
+        // 没有成功归档时保持幂等，不能误打开普通会话目录。
+        guard let lastSessionArchiveURL else { return }
+        // 选择精确归档目录，便于用户立即备份或检查原始文件。
+        NSWorkspace.shared.activateFileViewerSelecting([lastSessionArchiveURL])
+    }
+
+    // 归档损坏双代并用当前内存标签顺序重建可继续持久化的会话。
+    @discardableResult
+    func archiveCorruptedSessionAndRebuild(
+        date: Date = Date(),
+        identifier: UUID = UUID()
+    ) -> Bool {
+        // 只有启动恢复已确认不可恢复时才允许执行破坏性重建入口。
+        guard hasUnrecoverableSessionFailure else { return false }
+        // 新尝试开始前清除旧结果，失败时不能把上一次路径误当成本次成功。
+        lastSessionArchiveURL = nil
+        // 重建会话前先保存每个 dirty 标签正文，避免 UUID 映射落盘但内容仍只在内存。
+        for document in documents where !document.flushDraftIfNeeded() {
+            // 草稿失败时保留警示和原始损坏代，禁止制造不可恢复的新会话。
+            status = "会话归档重建失败，损坏数据仍保留在 \(sessionStore.storageDirectoryURL.path)：草稿保存失败"
+            // 明确返回失败供测试和后续生命周期保护使用。
+            return false
+        }
+        do {
+            // 原子归档双代后用当前内存标签身份、顺序和活动 UUID 建立新 current。
+            let result = try sessionStore.archiveCorruptedGenerationsAndReset(
+                to: currentSessionState,
+                date: date,
+                identifier: identifier
+            )
+            // 只有归档与新会话都成功后才关闭持续警示。
+            hasUnrecoverableSessionFailure = false
+            // 保留本次精确归档目录供完成提示和 Finder 动作使用。
+            lastSessionArchiveURL = result.directoryURL
+            // 把归档目录写入状态栏，便于用户稍后精确找回原始证据。
+            status = "损坏会话已归档并重建：\(result.directoryURL.path)"
+            // 明确返回成功供界面和测试确认闭环。
+            return true
+        } catch {
+            // 任一步失败都保留警示，不把部分操作误报为已经恢复。
+            hasUnrecoverableSessionFailure = true
+            // 同时给出原会话目录和底层原因，保证失败后证据仍可定位。
+            status = "会话归档重建失败，损坏数据仍保留在 \(sessionStore.storageDirectoryURL.path)：\(error.localizedDescription)"
+            // 让调用方继续阻止无提示退出。
+            return false
+        }
+    }
+
     // 判断另存为路径是否会与其他打开标签冲突。
     func canAdoptFileURL(_ rawURL: URL, for document: EditorModel) -> Bool {
         // 非文件 URL 不允许成为本地文档身份。
@@ -424,61 +557,117 @@ final class WorkspaceModel: ObservableObject {
     // 恢复上次标签顺序和活动标签。
     private func restoreLastSession() {
         do {
-            // 读取完整会话；首次启动返回 nil。
-            guard let session = try sessionStore.load() else {
+            // 读取完整会话及实际代次；首次启动返回 nil。
+            guard let initialSessionLoad = try sessionStore.loadWithRecoverySource() else {
                 // 首次启动迁移旧版草稿或展示示例。
                 appendInitialDocument()
                 return
             }
-            // 防止损坏会话中的重复路径产生多个标签。
-            var restoredFileURLs = Set<URL>()
-            // 按持久化顺序逐个恢复有效标签。
-            for descriptor in session.documents {
-                // 网络 URL 或重复文件路径直接跳过。
-                if let fileURL = descriptor.fileURL {
-                    // 统一标准化路径。
-                    let normalizedURL = fileURL.standardizedFileURL
-                    // 非本地或已经恢复的路径无效。
-                    guard fileURL.isFileURL, !restoredFileURLs.contains(normalizedURL) else { continue }
-                    // 先登记路径，防止后续重复项。
-                    restoredFileURLs.insert(normalizedURL)
+            // 默认先尝试正常加载规则选出的 current 或解码回退 previous。
+            var selectedSessionLoad = initialSessionLoad
+            // 只有身份布局有效且至少恢复一个标签时才接受本代。
+            var selectedDocuments = restorableDocuments(from: initialSessionLoad.state)
+            // current 可解码但语义失效时继续尝试 previous，不能先持久化新标签覆盖它。
+            if selectedDocuments == nil, !initialSessionLoad.recoveredFromPrevious {
+                // previous 不存在时保留 nil，稍后统一选择新建标签。
+                if let previousSession = try sessionStore.loadPreviousGeneration() {
+                    // previous 也必须通过相同身份和实际文档恢复检查。
+                    if let previousDocuments = restorableDocuments(from: previousSession) {
+                        // 明确记录最终选择来自 previous，后续修复 current 时必须保留恢复来源。
+                        selectedSessionLoad = WorkspaceSessionLoadResult(
+                            state: previousSession,
+                            recoveredFromPrevious: true
+                        )
+                        // 只有完整选择 previous 后才发布候选标签。
+                        selectedDocuments = previousDocuments
+                    }
                 }
-                // 文件失效无草稿时返回 nil，不影响其他标签。
-                guard let document = EditorModel.restore(descriptor, documentStore: documentStore) else {
-                    continue
-                }
-                // 建立工作区回调。
-                document.workspace = self
-                // 保持原始标签顺序。
-                documents.append(document)
             }
-            // 全部描述失效时回退新标签。
-            guard !documents.isEmpty else {
-                // 创建安全可编辑状态。
+            // current 与 previous 都没有可恢复标签时，完成选择后才创建并持久化新标签。
+            guard let selectedDocuments else {
+                // 创建安全可编辑状态，避免停留在空窗口。
                 appendInitialDocument()
+                // 只有新会话成功落盘时才用恢复结论替换普通状态。
+                if !status.contains("失败") {
+                    // 明确说明两代均未提供可恢复标签。
+                    status = "会话没有可恢复标签，已新建标签"
+                }
                 return
             }
+            // 最终候选明确后一次性发布标签，避免失败 current 的部分结果进入工作区。
+            documents = selectedDocuments
+            // 只有被选中的标签才建立工作区回调。
+            for document in documents {
+                // 工作区回调用于保存后刷新会话和最近文件。
+                document.workspace = self
+            }
+            // 后续活动 UUID 只消费已经明确选中的会话。
+            let session = selectedSessionLoad.state
             // 活动 UUID 有效时恢复，否则回退首个标签。
             activeDocumentID =
                 documents.contains(where: { $0.id == session.activeDocumentID })
                 ? session.activeDocumentID
                 : documents.first?.id
-            // 清理失效描述并保存规范化会话。
-            persistSession()
-            // 反馈有效标签数量。
-            status = "已恢复 \(documents.count) 个标签"
+            // previous 恢复只修复 current；current 正常恢复继续执行标准双代轮换。
+            guard
+                persistSession(
+                    preservingPreviousRecoverySource: selectedSessionLoad.recoveredFromPrevious
+                )
+            else { return }
+            // 上一代回退必须在界面明确可见，避免用户误以为当前代仍然完好。
+            status =
+                selectedSessionLoad.recoveredFromPrevious
+                ? "已从上一代会话恢复 \(documents.count) 个标签"
+                : "已恢复 \(documents.count) 个标签"
         } catch {
             // 会话 JSON 损坏时回退新标签，不崩溃也不覆盖草稿。
             status = "会话恢复失败，已新建标签：\(error.localizedDescription)"
-            // 创建安全可编辑状态。
-            appendInitialDocument()
+            // 发布持续恢复警示，普通状态文案变化也不能隐藏未解决的数据风险。
+            hasUnrecoverableSessionFailure = true
+            // 创建安全可编辑状态，但不迁移草稿或保存空会话覆盖损坏证据。
+            appendInitialDocument(allowsPersistence: false)
         }
     }
 
+    // 从单代会话构造完整候选；身份歧义或零个可恢复标签时整体拒绝。
+    private func restorableDocuments(from session: WorkspaceSessionState) -> [EditorModel]? {
+        // 空会话或重复 UUID 会破坏未命名草稿映射，必须整体回退上一代。
+        guard session.hasValidDocumentIdentityLayout else { return nil }
+        // 防止同一规范化文件路径在候选中产生多个标签。
+        var restoredFileURLs = Set<URL>()
+        // 候选标签暂存在局部数组，选择明确前不能发布到工作区或持久化。
+        var restoredDocuments: [EditorModel] = []
+        // 按持久化顺序逐个尝试恢复有效标签。
+        for descriptor in session.documents {
+            // 已命名标签需要先验证本地地址并按规范化路径去重。
+            if let fileURL = descriptor.fileURL {
+                // 统一标准化路径用于本代内部去重。
+                let normalizedURL = fileURL.standardizedFileURL
+                // 网络 URL 或重复文件路径不属于可恢复描述。
+                guard fileURL.isFileURL, !restoredFileURLs.contains(normalizedURL) else { continue }
+                // 先登记路径，防止后续重复项创建第二个模型。
+                restoredFileURLs.insert(normalizedURL)
+            }
+            // 文件失效且没有草稿时跳过；未命名标签继续用原 UUID 查找草稿。
+            guard let document = EditorModel.restore(descriptor, documentStore: documentStore) else {
+                // 单个失效描述不阻断同代其他标签。
+                continue
+            }
+            // 保持本代可恢复标签的原始顺序。
+            restoredDocuments.append(document)
+        }
+        // 零个实际标签表示本代不能作为恢复选择，必须继续尝试 previous。
+        guard !restoredDocuments.isEmpty else { return nil }
+        // 返回尚未发布、但已经完整确定的候选标签。
+        return restoredDocuments
+    }
+
     // 首次启动迁移 v0.1 草稿或创建示例标签。
-    private func appendInitialDocument() {
-        // 尝试读取旧版唯一未命名草稿。
-        let legacyDraft = try? documentStore.loadDraft(for: nil)
+    private func appendInitialDocument(allowsPersistence: Bool = true) {
+        // 会话损坏路径不得读取后再迁移任何旧草稿，避免制造无法持久化的新映射。
+        let legacyLoad = allowsPersistence ? try? documentStore.loadDraftWithRecoverySource(for: nil) : nil
+        // 后续初始化只使用已经通过身份校验的旧草稿。
+        let legacyDraft = legacyLoad?.draft
         // 为 v0.2 标签生成新 UUID。
         let documentID = UUID()
         // 旧草稿存在时保留正文和格式，否则展示示例。
@@ -492,7 +681,11 @@ final class WorkspaceModel: ObservableObject {
             savedText: "",
             savedEncoding: .utf8,
             savedIncludesByteOrderMark: false,
-            status: legacyDraft == nil ? "已就绪" : "已迁移旧版草稿",
+            status: legacyDraft == nil
+                ? "已就绪"
+                : legacyLoad?.recoveredFromPrevious == true
+                    ? "已从上一代恢复并迁移旧版草稿"
+                    : "已迁移旧版草稿",
             documentStore: documentStore
         )
         // 建立工作区回调。
@@ -502,7 +695,8 @@ final class WorkspaceModel: ObservableObject {
         // 设为活动标签。
         activeDocumentID = document.id
         // 旧草稿先复制到新 UUID 键，成功后才删除旧键。
-        if let legacyDraft,
+        if allowsPersistence,
+            let legacyDraft,
             (try? documentStore.saveDraft(
                 legacyDraft.text,
                 for: nil,
@@ -514,23 +708,26 @@ final class WorkspaceModel: ObservableObject {
             // 新草稿确认落盘后清理旧版唯一键。
             try? documentStore.removeDraft(for: nil)
         }
+        // 会话损坏时停止在纯内存安全状态，不能覆盖唯一恢复证据。
+        guard allowsPersistence else { return }
         // 保存首次 v0.2 会话。
         persistSession()
     }
 
     // 原子保存当前标签顺序和活动 UUID。
     @discardableResult
-    private func persistSession() -> Bool {
+    private func persistSession(preservingPreviousRecoverySource: Bool = false) -> Bool {
         do {
-            // 只保存身份和路径，正文继续由独立草稿管理。
-            let state = WorkspaceSessionState(
-                documents: documents.map {
-                    WorkspaceSessionDocument(id: $0.id, fileURL: $0.currentFileURL)
-                },
-                activeDocumentID: activeDocumentID
-            )
-            // 原子写入单个会话文件。
-            try sessionStore.save(state)
+            // previous 恢复时不能把语义失效的 current 晋升并覆盖唯一恢复来源。
+            if preservingPreviousRecoverySource {
+                // 只原子修复 current，并在提交前重新验证 previous 仍可解码。
+                try sessionStore.saveRecoveredCurrent(currentSessionState)
+            } else {
+                // 正常路径继续执行 current 到 previous 的标准双代轮换。
+                try sessionStore.save(currentSessionState)
+            }
+            // 外部人工修复后若普通保存恢复成功，同样关闭已经解决的持续警示。
+            hasUnrecoverableSessionFailure = false
             // 明确返回本轮会话已安全落盘。
             return true
         } catch {
@@ -539,6 +736,17 @@ final class WorkspaceModel: ObservableObject {
             // 让退出保护阻止无提示丢失标签顺序。
             return false
         }
+    }
+
+    // 从当前内存标签构建唯一会话描述，供普通保存和归档重建共享。
+    private var currentSessionState: WorkspaceSessionState {
+        // 只保存身份和路径，正文继续由独立草稿管理。
+        WorkspaceSessionState(
+            documents: documents.map {
+                WorkspaceSessionDocument(id: $0.id, fileURL: $0.currentFileURL)
+            },
+            activeDocumentID: activeDocumentID
+        )
     }
 
     // 刷新仍存在于磁盘的最近文件。
@@ -629,9 +837,9 @@ enum WorkspaceModelSelfCheck {
         else {
             throw DocumentSupportError.selfCheckFailed("多标签会话恢复")
         }
-        // 构造仅含失效文件的会话，验证恢复不会崩溃。
+        // 构造仅含失效文件的 current，验证工作区会回退仍有效的 previous。
         let missingID = UUID()
-        // 保存一个不存在且没有草稿的路径。
+        // 保存一个不存在且没有草稿的路径，迫使 current 无法恢复任何标签。
         try sessionStore.save(
             WorkspaceSessionState(
                 documents: [
@@ -643,18 +851,18 @@ enum WorkspaceModelSelfCheck {
                 activeDocumentID: missingID
             )
         )
-        // 恢复会跳过失效描述并创建安全新标签。
+        // 恢复必须在 current 零个有效描述时继续采用上一代会话。
         let fallbackWorkspace = WorkspaceModel(
             documentStore: documentStore,
             sessionStore: sessionStore,
             restoresSession: true
         )
-        // 安全回退必须留下一个可编辑标签。
-        guard fallbackWorkspace.documents.count == 1,
-            fallbackWorkspace.activeDocument != nil,
-            fallbackWorkspace.activeDocument?.id != missingID
+        // 安全回退必须恢复保存失效 current 前的完整标签顺序和活动身份。
+        guard fallbackWorkspace.documents.map(\.id) == expectedOrder,
+            fallbackWorkspace.activeDocument?.id == firstUntitled.id,
+            fallbackWorkspace.status == "已从上一代会话恢复 \(expectedOrder.count) 个标签"
         else {
-            throw DocumentSupportError.selfCheckFailed("失效文件安全回退")
+            throw DocumentSupportError.selfCheckFailed("失效 current 回退上一代")
         }
         // 用普通文件占据会话根目录，稳定制造会话写入失败。
         let blockedSessionRoot = rootDirectory.appendingPathComponent("blocked-session-root")
@@ -673,6 +881,6 @@ enum WorkspaceModelSelfCheck {
             throw DocumentSupportError.selfCheckFailed("会话失败阻止退出")
         }
         // 返回可复核的综合通过标记。
-        return "WorkspaceModelSelfCheck：多标签去重、独立草稿、顺序、活动标签、失效文件与退出保护通过"
+        return "WorkspaceModelSelfCheck：多标签去重、独立草稿、顺序、活动标签、失效 current 回退与退出保护通过"
     }
 }

@@ -302,6 +302,14 @@ struct DocumentDraft: Codable, Equatable, Sendable {
     }
 }
 
+// 返回草稿正文和实际采用的持久化代次。
+struct DraftLoadResult: Equatable, Sendable {
+    // 保存已经通过文档身份校验的草稿。
+    let draft: DocumentDraft
+    // true 表示当前代不可用并已安全回退到上一代。
+    let recoveredFromPrevious: Bool
+}
+
 // 保存一个最近打开文档及其最后访问时间。
 struct RecentDocument: Codable, Equatable, Identifiable {
     // 规范化 URL 同时作为菜单去重标识。
@@ -439,6 +447,15 @@ final class DocumentSupportStore: @unchecked Sendable {
         let encoder = Self.makeEncoder()
         // 编码在内存完成，失败时不会碰触已有草稿。
         let data = try encoder.encode(reservation.draft)
+        // 固定上一代地址与当前草稿使用同一稳定文档键。
+        let previousURL = previousDraftFileURL(for: reservation.destinationURL)
+        // 写入前只轮换已经解码且身份匹配的当前代，损坏数据不得污染有效备份。
+        try preparePreviousDraftBeforeWrite(
+            currentURL: reservation.destinationURL,
+            previousURL: previousURL,
+            expectedFileURL: reservation.draft.fileURL,
+            expectedUntitledID: reservation.draft.untitledID
+        )
         // 原子替换确保崩溃时保留旧草稿或新草稿之一。
         try data.write(
             to: reservation.destinationURL,
@@ -482,26 +499,60 @@ final class DocumentSupportStore: @unchecked Sendable {
 
     // 恢复指定文件或未命名文档自己的草稿。
     func loadDraft(for fileURL: URL?, untitledID: UUID? = nil) throws -> DocumentDraft? {
+        // 保持既有 API，仅丢弃调用方不关心的恢复来源。
+        try loadDraftWithRecoverySource(for: fileURL, untitledID: untitledID)?.draft
+    }
+
+    // 恢复草稿并报告是否采用了上一代有效快照。
+    func loadDraftWithRecoverySource(
+        for fileURL: URL?,
+        untitledID: UUID? = nil
+    ) throws -> DraftLoadResult? {
         // 使用与保存完全相同的 URL 规范化规则。
         let normalizedURL = try normalizedOptionalFileURL(fileURL)
         // 根据稳定键定位唯一草稿文件。
-        let url = draftFileURL(for: normalizedURL, untitledID: untitledID)
-        // 没有草稿属于正常状态，不转成错误。
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
-        // 一次读取完整 JSON，避免部分字段来自不同版本。
-        let data = try Data(contentsOf: url)
-        // 每次调用使用独立解码器，允许与后台写入并发执行。
-        let decoder = Self.makeDecoder()
-        // 解码完整恢复记录。
-        let draft = try decoder.decode(DocumentDraft.self, from: data)
-        // 对比记录内 URL，防止哈希碰撞造成跨文档恢复。
+        let currentURL = draftFileURL(for: normalizedURL, untitledID: untitledID)
+        // 上一代沿用同一稳定键，仅用固定后缀区分。
+        let previousURL = previousDraftFileURL(for: currentURL)
         let expectedUntitledID = normalizedURL == nil ? untitledID : nil
-        // 文件路径和未命名标签 UUID 都必须匹配，防止跨标签串稿。
-        guard draft.fileURL == normalizedURL, draft.untitledID == expectedUntitledID else {
-            throw DocumentSupportError.draftIdentityMismatch
+        // 读取与轮换共用同一把锁，避免观察到两次原子写入之间的临时组合。
+        draftMutationLock.lock()
+        // 任意返回或错误路径都必须释放锁。
+        defer { draftMutationLock.unlock() }
+        // 当前代不存在时仍允许读取一次上一代有效快照。
+        guard fileManager.fileExists(atPath: currentURL.path) else {
+            // 两代都不存在属于首次使用，不转成错误。
+            guard fileManager.fileExists(atPath: previousURL.path) else { return nil }
+            // 上一代也必须完整解码并匹配目标身份。
+            let previous = try validatedDraftRecord(
+                at: previousURL,
+                expectedFileURL: normalizedURL,
+                expectedUntitledID: expectedUntitledID
+            )
+            // 明确标记本次恢复来自上一代。
+            return DraftLoadResult(draft: previous.draft, recoveredFromPrevious: true)
         }
-        // 返回已经验证身份的草稿。
-        return draft
+        do {
+            // 正常路径优先读取当前代。
+            let current = try validatedDraftRecord(
+                at: currentURL,
+                expectedFileURL: normalizedURL,
+                expectedUntitledID: expectedUntitledID
+            )
+            // 当前代有效时不得被更旧备份反转。
+            return DraftLoadResult(draft: current.draft, recoveredFromPrevious: false)
+        } catch {
+            // 当前代读取、解码或身份校验失败时才允许尝试上一代。
+            guard fileManager.fileExists(atPath: previousURL.path) else { throw error }
+            // 上一代必须独立通过严格身份校验，不能因 current 损坏而放宽串稿保护。
+            let previous = try validatedDraftRecord(
+                at: previousURL,
+                expectedFileURL: normalizedURL,
+                expectedUntitledID: expectedUntitledID
+            )
+            // current 身份错配但 previous 匹配时也允许安全恢复目标正文。
+            return DraftLoadResult(draft: previous.draft, recoveredFromPrevious: true)
+        }
     }
 
     // 删除保存成功后不再需要的指定草稿。
@@ -509,19 +560,40 @@ final class DocumentSupportStore: @unchecked Sendable {
         // 规范化 URL 以命中保存时的稳定键。
         let normalizedURL = try normalizedOptionalFileURL(fileURL)
         // 计算草稿文件地址。
-        let url = draftFileURL(for: normalizedURL, untitledID: untitledID)
+        let currentURL = draftFileURL(for: normalizedURL, untitledID: untitledID)
+        // 同一删除操作必须覆盖固定上一代地址。
+        let previousURL = previousDraftFileURL(for: currentURL)
+        // 未命名草稿必须继续按调用方标签 UUID 校验内嵌身份。
+        let expectedUntitledID = normalizedURL == nil ? untitledID : nil
         // 删除和后台写入必须经过同一顺序屏障。
         draftMutationLock.lock()
         // 任意退出路径都必须释放锁。
         defer { draftMutationLock.unlock() }
+        // 删除任何一代前先校验全部可解码记录，避免哈希碰撞时删除其他文档草稿。
+        try validateDraftIdentityBeforeRemoval(
+            at: currentURL,
+            expectedFileURL: normalizedURL,
+            expectedUntitledID: expectedUntitledID
+        )
+        // previous 也必须独立匹配目标身份，验证完成前不能产生部分删除。
+        try validateDraftIdentityBeforeRemoval(
+            at: previousURL,
+            expectedFileURL: normalizedURL,
+            expectedUntitledID: expectedUntitledID
+        )
         // 删除分配更晚单调序号，不依赖可回拨的墙上时钟。
         let removalGeneration = nextDraftGenerationWhileLocked()
         // 即使文件已不存在也推进生效序号，阻止已排队旧任务重新创建。
-        latestAppliedDraftGeneration[url.path] = removalGeneration
-        // 草稿本就不存在时保持幂等。
-        guard fileManager.fileExists(atPath: url.path) else { return }
-        // 只删除精确草稿文件，不递归触碰其他文档。
-        try fileManager.removeItem(at: url)
+        latestAppliedDraftGeneration[currentURL.path] = removalGeneration
+        // 先删上一代，失败时保留当前代供后续恢复或重试。
+        if fileManager.fileExists(atPath: previousURL.path) {
+            // 只删除同一稳定键的固定上一代文件。
+            try fileManager.removeItem(at: previousURL)
+        }
+        // 当前代本就不存在时保持幂等。
+        guard fileManager.fileExists(atPath: currentURL.path) else { return }
+        // 上一代清理成功后再删除当前代。
+        try fileManager.removeItem(at: currentURL)
     }
 
     // 记录一次成功打开或保存的本地文件。
@@ -616,6 +688,116 @@ final class DocumentSupportStore: @unchecked Sendable {
         let safeKey = key ?? "untitled"
         // 每个文档对应一个独立 JSON 文件。
         return draftsDirectory.appendingPathComponent("\(safeKey).json", isDirectory: false)
+    }
+
+    // 由当前草稿地址计算固定上一代地址。
+    private func previousDraftFileURL(for currentURL: URL) -> URL {
+        // 先移除 json 扩展名再追加 previous.json，保持目录和文档键不变。
+        currentURL
+            .deletingPathExtension()
+            .appendingPathExtension("previous")
+            .appendingPathExtension("json")
+    }
+
+    // 写入新 current 前准备一份经过身份验证的 previous；调用方必须持有草稿锁。
+    private func preparePreviousDraftBeforeWrite(
+        currentURL: URL,
+        previousURL: URL,
+        expectedFileURL: URL?,
+        expectedUntitledID: UUID?
+    ) throws {
+        // current 不存在时无需轮换，但已有 previous 不能属于其他文档。
+        guard fileManager.fileExists(atPath: currentURL.path) else {
+            // 没有历史文件时直接允许首次 current 写入。
+            guard fileManager.fileExists(atPath: previousURL.path) else { return }
+            do {
+                // 可解码 previous 必须匹配目标身份。
+                _ = try validatedDraftRecord(
+                    at: previousURL,
+                    expectedFileURL: expectedFileURL,
+                    expectedUntitledID: expectedUntitledID
+                )
+            } catch is DecodingError {
+                // 损坏 previous 不会被本次首次 current 写入覆盖，保留后允许继续保存新正文。
+            }
+            // previous 有效或仍原样保留时都不需要轮换。
+            return
+        }
+
+        do {
+            // 一次取得 current 的已验证模型和原始字节，避免重新编码改变历史快照。
+            let current = try validatedDraftRecord(
+                at: currentURL,
+                expectedFileURL: expectedFileURL,
+                expectedUntitledID: expectedUntitledID
+            )
+            // 已存在 previous 时先阻止可识别的跨文档覆盖。
+            if fileManager.fileExists(atPath: previousURL.path) {
+                do {
+                    // 有效 previous 必须与 current 属于同一文档。
+                    _ = try validatedDraftRecord(
+                        at: previousURL,
+                        expectedFileURL: expectedFileURL,
+                        expectedUntitledID: expectedUntitledID
+                    )
+                } catch is DecodingError {
+                    // current 已验证有效，因此允许用它修复损坏 previous。
+                }
+            }
+            // previous 原子更新成功后才允许调用方替换 current。
+            try current.data.write(to: previousURL, options: [.atomic])
+        } catch let error as DecodingError {
+            // current 损坏时必须依赖已经存在且有效的 previous 才能继续写新 current。
+            guard fileManager.fileExists(atPath: previousURL.path) else { throw error }
+            // previous 读取、解码和身份任一失败都会中止写入并保留两份原数据。
+            _ = try validatedDraftRecord(
+                at: previousURL,
+                expectedFileURL: expectedFileURL,
+                expectedUntitledID: expectedUntitledID
+            )
+        }
+    }
+
+    // 读取一代完整草稿并严格验证它属于目标文档。
+    private func validatedDraftRecord(
+        at url: URL,
+        expectedFileURL: URL?,
+        expectedUntitledID: UUID?
+    ) throws -> (draft: DocumentDraft, data: Data) {
+        // 一次读取完整原始 JSON，供校验和上一代字节复制共同使用。
+        let data = try Data(contentsOf: url)
+        // 每次读取使用独立解码器，避免跨线程共享 Foundation 可变对象。
+        let decoder = Self.makeDecoder()
+        // 解码失败由调用方决定是否安全回退。
+        let draft = try decoder.decode(DocumentDraft.self, from: data)
+        // 文件路径和未命名标签 UUID 都必须匹配，防止哈希碰撞或跨标签串稿。
+        guard draft.fileURL == expectedFileURL, draft.untitledID == expectedUntitledID else {
+            // 身份错误必须与普通 JSON 损坏明确区分。
+            throw DocumentSupportError.draftIdentityMismatch
+        }
+        // 返回同一次读取对应的模型和原始字节。
+        return (draft, data)
+    }
+
+    // 删除前校验可解码草稿身份；无效 JSON 可由明确保存或丢弃流程清理。
+    private func validateDraftIdentityBeforeRemoval(
+        at url: URL,
+        expectedFileURL: URL?,
+        expectedUntitledID: UUID?
+    ) throws {
+        // 不存在的代次保持幂等，不阻止另一代清理。
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        do {
+            // 可解码记录必须严格属于目标文档，防止哈希碰撞或错位删除。
+            _ = try validatedDraftRecord(
+                at: url,
+                expectedFileURL: expectedFileURL,
+                expectedUntitledID: expectedUntitledID
+            )
+        } catch is DecodingError {
+            // 无效 JSON 不含可信身份；上层独立恢复失败保护负责要求明确保存或丢弃。
+            return
+        }
     }
 
     // 读取最近文件索引，不存在时返回空列表。

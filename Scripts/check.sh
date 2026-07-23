@@ -37,6 +37,23 @@ swift format lint --strict --recursive \
 swift build --disable-sandbox --package-path "$PROJECT_DIR" -Xswiftc -warnings-as-errors
 # 标准 SwiftPM 测试显式串行执行，避免共享测试进程的调度影响确定性回归。
 swift test --disable-sandbox --package-path "$PROJECT_DIR" --no-parallel -Xswiftc -warnings-as-errors
+# 大样本端到端测试只在独立 release 进程执行，避免 Debug 全量测试重复 50MB IO。
+swift test --configuration release --disable-sandbox --package-path "$PROJECT_DIR" \
+    --no-parallel -Xswiftc -warnings-as-errors --filter WorkspaceEndToEndPerformanceTests
 # 发布配置的独立进程验证完整链路和两档性能目标，口径与最终应用一致。
 swift run --configuration release --disable-sandbox --package-path "$PROJECT_DIR" \
     -Xswiftc -warnings-as-errors MarkdownLiteMac --self-check
+# 先完整扫描刚构建的 Release 可执行文件；strings 失败会由 set -e 关闭式阻断。
+RELEASE_BINARY_STRINGS="$(strings "$PROJECT_DIR/.build/release/MarkdownLiteMac")"
+# 再从已成功取得的字符串中查找测试参数；grep 无匹配是唯一允许的非零状态。
+RELEASE_TEST_CLI_MARKERS="$(
+    grep -E -- '--test-crash-recovery-(writer|reader)|--test-temp-root' \
+        <<<"$RELEASE_BINARY_STRINGS" || true
+)"
+# 任一隐藏测试入口残留都立即阻断发布检查。
+if [[ -n "$RELEASE_TEST_CLI_MARKERS" ]]; then
+    # 只输出固定错误，不回显二进制内容或本机路径。
+    echo "Release 可执行文件仍包含崩溃恢复测试入口" >&2
+    # 非零退出让本地和 CI 使用同一安全门禁。
+    exit 1
+fi
