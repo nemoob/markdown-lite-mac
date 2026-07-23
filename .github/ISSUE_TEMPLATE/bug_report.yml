@@ -1,5 +1,5 @@
 name: Bug report / 缺陷报告
-description: Report a reproducible problem in Markdown Lite / 报告可复现的问题
+description: Report a reproducible problem in Mojian / 报告可复现的问题
 title: "[Bug] "
 labels:
   - bug
@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Markdown Lite. For security or privacy vulnerabilities, follow [SECURITY.md](https://github.com/nemoob/markdown-lite-mac/security/policy) instead of opening a public issue.
+        Thanks for helping improve Mojian. For security or privacy vulnerabilities, follow [SECURITY.md](https://github.com/nemoob/mojian-editor/security/policy) instead of opening a public issue.
 
   - type: textarea
     id: summary
@@ -32,7 +32,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: Markdown Lite version or commit / 版本或提交
+      label: Mojian version or commit / 版本或提交
       placeholder: vX.Y.Z or commit SHA
     validations:
       required: true

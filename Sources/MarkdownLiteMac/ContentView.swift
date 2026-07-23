@@ -255,7 +255,7 @@ private struct WorkspaceEditorView: View {
     // 顶部只保留高频文件和发布动作。
     private var topToolbar: some View {
         HStack(spacing: 10) {
-            Text("Markdown Lite")
+            Text("墨简")
                 .font(.headline)
             // 橙点明确当前活动标签尚未写回真实文件。
             Circle()

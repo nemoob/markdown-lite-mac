@@ -112,6 +112,17 @@ private final class SpawnedLockHolder {
 // 覆盖同路径互斥、真实跨进程释放、路径隔离和锁文件安全属性。
 @Suite("应用单实例锁")
 struct ApplicationInstanceLockTests {
+    // 品牌迁移不能改变旧版本仍在使用的恢复根和锁文件身份。
+    @Test("品牌迁移保留跨版本存储与锁身份")
+    func brandMigrationRetainsStorageAndLockIdentity() {
+        // 读取生产会话存储实际采用的默认根目录。
+        let rootDirectory = WorkspaceSessionStore.defaultRootDirectory(fileManager: .default)
+        // 旧目录名保证墨简可以继续恢复 v0.11 的会话和草稿。
+        #expect(rootDirectory.lastPathComponent == "MarkdownLiteMac")
+        // 旧锁文件名保证新旧版本不能同时写同一恢复目录。
+        #expect(ApplicationInstanceLock.lockFilename == "ApplicationInstance.lock")
+    }
+
     // 同一固定路径的第二个持有者必须立即得到已运行错误。
     @Test("相同路径非阻塞互斥")
     func samePathIsMutuallyExclusive() throws {

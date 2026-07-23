@@ -44,11 +44,16 @@ jobs:
           source_build="$(plutil -extract CFBundleVersion raw -o - Support/Info.plist)"
           [[ "$source_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ "$source_build" =~ ^[0-9]+$ ]]
-          test -x dist/MarkdownLiteMac.app/Contents/MacOS/MarkdownLiteMac
-          plutil -lint dist/MarkdownLiteMac.app/Contents/Info.plist
-          test "$(plutil -extract CFBundleShortVersionString raw -o - dist/MarkdownLiteMac.app/Contents/Info.plist)" = "$source_version"
-          test "$(plutil -extract CFBundleVersion raw -o - dist/MarkdownLiteMac.app/Contents/Info.plist)" = "$source_build"
+          test ! -e dist/MarkdownLiteMac.app
+          test -x dist/Mojian.app/Contents/MacOS/MarkdownLiteMac
+          plutil -lint dist/Mojian.app/Contents/Info.plist
+          test "$(plutil -extract CFBundleDisplayName raw -o - dist/Mojian.app/Contents/Info.plist)" = "墨简"
+          test "$(plutil -extract CFBundleName raw -o - dist/Mojian.app/Contents/Info.plist)" = "墨简"
+          test "$(plutil -extract CFBundleExecutable raw -o - dist/Mojian.app/Contents/Info.plist)" = "MarkdownLiteMac"
+          test "$(plutil -extract CFBundleIdentifier raw -o - dist/Mojian.app/Contents/Info.plist)" = "cn.nemoob.markdown-lite-mac"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - dist/Mojian.app/Contents/Info.plist)" = "$source_version"
+          test "$(plutil -extract CFBundleVersion raw -o - dist/Mojian.app/Contents/Info.plist)" = "$source_build"
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             test "$GITHUB_REF_NAME" = "v$source_version"
           fi
-          codesign --verify --deep --strict dist/MarkdownLiteMac.app
+          codesign --verify --deep --strict dist/Mojian.app

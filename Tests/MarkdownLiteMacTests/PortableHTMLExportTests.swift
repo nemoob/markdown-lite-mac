@@ -352,7 +352,7 @@ struct PortableHTMLExportTests {
         #expect(try String(contentsOf: outputURL, encoding: .utf8) == "旧导出")
         // 取消路径必须可靠清理同目录的唯一临时文件。
         let remainingNames = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        // 目录中不能残留任何 Markdown Lite 导出临时文件。
+        // 目录中不能残留任何墨简导出临时文件。
         #expect(!remainingNames.contains(where: { $0.hasPrefix(".markdown-lite-") }))
     }
 

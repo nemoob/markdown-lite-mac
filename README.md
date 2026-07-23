@@ -1,14 +1,24 @@
-# Markdown Lite
+# 墨简（Mojian）
 
-[![CI](https://github.com/nemoob/markdown-lite-mac/actions/workflows/ci.yml/badge.svg)](https://github.com/nemoob/markdown-lite-mac/actions/workflows/ci.yml)
+[![CI](https://github.com/nemoob/mojian-editor/actions/workflows/ci.yml/badge.svg)](https://github.com/nemoob/mojian-editor/actions/workflows/ci.yml)
 
 一个以原生体验、数据安全和可测性能为优先级的 macOS Markdown 编辑器。
 
-> **English:** Markdown Lite is a small, native Markdown editor for macOS, built with SwiftUI and AppKit. It focuses on fast editing, local-first data handling, crash recovery, and practical HTML publishing.
+> **English:** Mojian is a small, native Markdown editor for macOS, built with SwiftUI and AppKit. It focuses on fast editing, local-first data handling, crash recovery, and practical HTML publishing.
 
-本源码对应 v0.11.0，适合从源码构建和参与开发；当前公开 Beta 以
-[GitHub Releases](https://github.com/nemoob/markdown-lite-mac/releases) 中最新 prerelease 为准。项目主页：
-[github.com/nemoob/markdown-lite-mac](https://github.com/nemoob/markdown-lite-mac)。
+当前发布基线为 v0.11.0，适合从源码构建和参与开发；公开 Beta 以
+[GitHub Releases](https://github.com/nemoob/mojian-editor/releases) 中最新 prerelease 为准。项目主页：
+[github.com/nemoob/mojian-editor](https://github.com/nemoob/mojian-editor)。
+
+## 平台与仓库
+
+本仓库 `nemoob/mojian-editor` 当前只维护 macOS 原生 Swift 版本。其他平台如开始开发，将使用独立仓库；在仓库实际创建前，下列名称只表示已经确定的边界，不提供链接。
+
+| 平台 | 仓库 | 状态 |
+| --- | --- | --- |
+| macOS | [`nemoob/mojian-editor`](https://github.com/nemoob/mojian-editor) | 当前维护，SwiftUI + AppKit |
+| Windows | `nemoob/mojian-editor-window` | 规划名称，尚未创建 |
+| Linux | `nemoob/mojian-editor-linux` | 规划名称，尚未创建 |
 
 ## 功能
 
@@ -76,7 +86,7 @@ swift test --disable-sandbox --no-parallel -Xswiftc -warnings-as-errors
 
 ```bash
 bash Scripts/package-app.sh
-open dist/MarkdownLiteMac.app
+open dist/Mojian.app
 ```
 
 脚本会生成 release 可执行文件、标准应用目录和本地图标，并执行可复现的本地 ad hoc 签名。该产物仅用于本地开发和验证，不得直接上传为 GitHub Release 的正式下载。
@@ -110,7 +120,7 @@ v0.11 继续用独立 release 测试进程执行真实工作区门禁：1 个和
 ## 隐私
 
 - Markdown 正文、草稿、会话和导出均在本机处理，不上传到项目维护者或第三方服务。
-- 会话、恢复草稿、单写者锁和用户明确创建的故障归档均保存在 `~/Library/Application Support/MarkdownLiteMac/`，不会上传。
+- 会话、恢复草稿、单写者锁和用户明确创建的故障归档均保存在 `~/Library/Application Support/MarkdownLiteMac/`，不会上传。该旧技术路径为兼容 v0.11 及更早版本的数据而保留。
 - 图片导入只写入当前已保存文档同级的 `assets/` 目录。
 - 应用没有账号、遥测或云同步功能。
 - 远程图片默认不联网：明文 `http` 图片始终阻止，`https` 图片仅在用户点击当前图片的加载按钮后向对应站点发起请求。
@@ -118,9 +128,9 @@ v0.11 继续用独立 release 测试进程执行真实工作区门禁：1 个和
 
 ## 截图
 
-![Markdown Lite 格式菜单、实时预览与远程图片隐私确认](docs/screenshots/markdown-lite-v04.png)
+![墨简的原生编辑、任务列表、大纲与实时预览](docs/screenshots/mojian-current.png)
 
-截图使用脱敏示例文档，展示原生编辑、格式菜单、增量语法着色、大纲、实时预览和远程图片默认不联网的确认状态。
+截图使用隔离的本地数据目录和内置示例文档，展示原生编辑、增量语法着色、任务列表、大纲和实时预览，不包含用户文档或本机路径。
 
 ## 已知边界
 
@@ -135,7 +145,7 @@ v0.11 继续用独立 release 测试进程执行真实工作区门禁：1 个和
 
 ## 参与贡献与安全
 
-问题和功能建议请提交到 [GitHub Issues](https://github.com/nemoob/markdown-lite-mac/issues)。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)、[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) 和 [AGENTS.md](AGENTS.md)。安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。
+问题和功能建议请提交到 [GitHub Issues](https://github.com/nemoob/mojian-editor/issues)。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)、[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) 和 [AGENTS.md](AGENTS.md)。安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。
 
 ## 许可证
 

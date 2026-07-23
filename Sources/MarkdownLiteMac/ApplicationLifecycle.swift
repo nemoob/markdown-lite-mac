@@ -14,7 +14,7 @@ enum ApplicationInstanceLockError: Error, Equatable, LocalizedError {
         // 已运行实例使用明确文案，避免被误解为文档损坏。
         switch self {
         case .alreadyRunning:
-            return "Markdown Lite 已在运行"
+            return "墨简已在运行"
         case let .ioFailure(operation, code):
             // 系统错误码保留给用户反馈和问题排查。
             return "无法完成进程锁操作 \(operation)（错误码 \(code)）"

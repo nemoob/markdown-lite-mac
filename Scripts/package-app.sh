@@ -9,8 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # 输出固定放在项目 dist 目录。
 DIST_DIR="$PROJECT_DIR/dist"
-# 应用包名称与可执行产品保持一致。
-APP_BUNDLE="$DIST_DIR/MarkdownLiteMac.app"
+# 对外应用包使用产品英文名，内部 SwiftPM 可执行产品保留稳定技术名称。
+APP_BUNDLE="$DIST_DIR/Mojian.app"
+# 旧品牌应用包只属于本地构建产物，打包时精确清理以免误开旧版本。
+LEGACY_APP_BUNDLE="$DIST_DIR/MarkdownLiteMac.app"
 # 应用包内部目录使用标准 macOS 布局。
 CONTENTS_DIR="$APP_BUNDLE/Contents"
 # 复用仓库内唯一的 Info.plist 源文件。
@@ -53,8 +55,10 @@ PACKAGE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/markdown-lite-package.XXXXXX")"
 # 无论成功失败都清理本次临时文件。
 trap 'rm -rf "$PACKAGE_TMP"' EXIT
 
-# 只替换本项目下的明确应用包目标，保证脚本可重复执行。
+# 只替换本项目下的明确新应用包目标，保证脚本可重复执行。
 rm -rf "$APP_BUNDLE"
+# 同步清理同一 dist 下由旧版脚本生成的明确应用包，不触碰其他产物。
+rm -rf "$LEGACY_APP_BUNDLE"
 # 创建标准的可执行文件和资源目录。
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 # 安装 release 二进制并确保具有执行权限。

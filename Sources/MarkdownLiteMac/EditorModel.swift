@@ -18,7 +18,7 @@ private enum BackgroundHTMLExportResult: Sendable {
 final class EditorModel: ObservableObject, Identifiable {
     // 首次启动提供一份可直接修改的示例。
     static let sample = """
-        # Markdown Lite
+        # 墨简
 
         这是一个轻量的原生 Mac Markdown 编辑器。
 

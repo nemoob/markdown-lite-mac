@@ -31,7 +31,7 @@ struct SmartListEditingTests {
     // 三种无序标记都应按用户当前风格继续，而不是统一改成减号。
     @Test("无序列表保留减号星号和加号")
     func testAllUnorderedMarkersArePreserved() throws {
-        // 逐项覆盖 Markdown Lite 解析器已经接受的全部无序标记。
+        // 逐项覆盖墨简解析器已经接受的全部无序标记。
         for marker in ["-", "*", "+"] {
             // 每个样本都带制表符缩进，验证行级前缀按原文保留。
             let source = "\t\(marker) 项目"
